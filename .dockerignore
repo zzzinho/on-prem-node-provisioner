@@ -1,0 +1,32 @@
+# Keep the build context tiny and deterministic.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# Docs and planning — not needed to compile.
+docs/
+*.md
+
+# Build artifacts / editor cruft (mirrors .gitignore essentials).
+bin/
+testbin/
+*.test
+*.out
+cover.out
+coverage.html
+vendor/
+.vscode/
+.idea/
+.DS_Store
+tmp/
+.tmp/
+
+# Secrets / local overrides — must never enter an image.
+*.env
+.env.local
+*.pem
+*.key
+kubeconfig
+.kube/
+*.local.yaml

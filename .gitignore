@@ -1,0 +1,51 @@
+# Binaries
+bin/
+testbin/
+*.test
+*.out
+cover.out
+coverage.html
+
+# Go
+vendor/
+
+# kubebuilder
+config/manager/manager_image_patch.yaml-e
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# macOS
+.DS_Store
+
+# Logs / scratch
+*.log
+tmp/
+.tmp/
+
+# Secrets
+*.env
+.env.local
+.env.*.local
+*.pem
+*.key
+kubeconfig
+.kube/
+
+# Helm
+charts/*/charts/
+charts/*/Chart.lock
+
+# Local overrides — never commit
+local.yaml
+*.local.yaml
+
+# AI coding assistants — personal/local state only.
+# CLAUDE.md at repo root is the committed shared guide; the .claude/ dir is not.
+.claude/
+CLAUDE.local.md
