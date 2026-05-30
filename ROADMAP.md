@@ -92,11 +92,11 @@
 
 #### M2.1 — provider + agent (M1 재사용)
 
-- [ ] `internal/power/provider.go` — `PowerProvider` 인터페이스 + `Capabilities` + registry + `ErrUnsupported`
-- [ ] `internal/agent/server.go` — HTTP `POST /wake {mac, broadcast}` → `wol.Send` (M1 코드)
-- [ ] `cmd/onp-wol-agent/main.go` — hostNetwork HTTP 서버
-- [ ] `internal/power/wol/{provider.go, client.go}` — wol provider(= agent HTTP 클라이언트), capabilities `{CanPowerOn: true}`
-- [ ] ✅ 체크포인트: agent 에 wake 요청 → **실제 매직패킷 송신** (클러스터 없이 단독 검증)
+- [x] `internal/power/provider.go` — `PowerProvider` 인터페이스 + `Capabilities` + registry + `ErrUnsupported`
+- [x] `internal/power/wol/{wire.go, client.go}` — **순수(k8s-free)** wire 타입 + agent HTTP 클라이언트
+- [x] `internal/power/wolprovider.go` — `*Machine` 결합 wol provider, capabilities `{CanPowerOn: true}` (agent 경량화 위해 순수 `wol` 패키지와 분리 — ROADMAP 원안의 `wol/provider.go` 에서 변경)
+- [x] `internal/agent/server.go` + `cmd/onp-wol-agent/main.go` — hostNetwork HTTP `POST /wake` → `wol.Send`(M1), slog 로깅, **k8s 의존성 0**
+- [x] ✅ 체크포인트: `desktop` 노드에서 agent 가 실제 LAN broadcast 송신 (204 + JSON 로그) 검증 완료
 
 #### M2.2 — reconciler wake 경로
 
