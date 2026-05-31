@@ -7,14 +7,16 @@
 
 CONTROLLER_GEN := go tool controller-gen
 CRD_DIR := config/crd/bases
+RBAC_DIR := config/rbac
 
 .PHONY: generate
 generate: ## Generate DeepCopy methods (zz_generated.deepcopy.go).
 	$(CONTROLLER_GEN) object paths=./api/...
 
 .PHONY: manifests
-manifests: ## Generate CRD manifests into config/crd/bases.
+manifests: ## Generate CRD manifests and the controller RBAC Role.
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:dir=$(CRD_DIR)
+	$(CONTROLLER_GEN) rbac:roleName=onp-controller paths=./internal/controller/... output:rbac:dir=$(RBAC_DIR)
 
 .PHONY: build
 build: ## Build all binaries.

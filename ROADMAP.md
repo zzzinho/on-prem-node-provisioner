@@ -100,13 +100,14 @@
 
 #### M2.2 — reconciler wake 경로
 
-- [ ] `internal/controller/machine_controller.go`:
+- [x] `internal/controller/machine_controller.go`:
   - 어노테이션 `onp.io/wake-now=true` + `state=Off` → `provider.PowerOn` → `state=Booting`
-  - Node watch (`EnqueueRequestsFromMapFunc`) → 대상 Node Ready → `state=Ready` + 어노테이션 제거
-  - `bootTimeout` 경과(Ready 미관찰) → `state=Failed` + Event
+  - Node watch (`EnqueueRequestsFromMapFunc` + `spec.nodeName` field indexer) → 대상 Node Ready → `state=Ready` + 어노테이션 제거
+  - `bootTimeout` 경과(Ready 미관찰) → `state=Failed` + Event; PowerOn 실패는 `Off` 유지 + backoff 재시도
   - 컨트롤러 재시작에도 idempotent (source of truth = `status.state`)
-- [ ] `internal/controller/machine_controller_test.go` — envtest
-- [ ] ✅ 체크포인트: in-cluster 에서 어노테이션 한 줄에 상태 전이
+- [x] `internal/controller/machine_controller_test.go` — **fake client + fake clock/provider**, 5개 전이 케이스 (envtest 대신 hermetic)
+- [x] RBAC(`config/rbac/role.yaml`) 생성, `status.bootStartTime` CRD 필드 추가
+- [x] ✅ 체크포인트: microk8s 에서 `desktop1` Machine 어노테이션 → `Off → Booting → Ready` 라이브 검증 (Events 로 확인)
 
 #### M2.3 — Helm 차트 + 배포 + E2E
 

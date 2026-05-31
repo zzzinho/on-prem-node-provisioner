@@ -100,6 +100,14 @@ type MachineStatus struct {
 	// +optional
 	State MachineState `json:"state,omitempty"`
 
+	// BootStartTime is when the controller issued the power-on that moved this
+	// Machine into Booting. It is the source of truth for the boot-timeout
+	// check: keeping it as an explicit field (rather than reading a Condition's
+	// lastTransitionTime) makes the timeout independent of unrelated condition
+	// updates and keeps reconcile idempotent across controller restarts.
+	// +optional
+	BootStartTime *metav1.Time `json:"bootStartTime,omitempty"`
+
 	// Conditions follow the standard Kubernetes condition pattern.
 	// +listType=map
 	// +listMapKey=type
