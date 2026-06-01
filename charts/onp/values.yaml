@@ -1,0 +1,51 @@
+# Image coordinates. Both images live in the same self-hosted registry under a
+# common repository prefix: <registry>/<repository>/<component>:<tag>.
+# Anonymous pull is enabled on the registry, so no imagePullSecrets are needed.
+image:
+  # Defaults to GitHub Container Registry. Override for your own registry, e.g.
+  #   --set image.registry=<your-registry>   (or a local -f values file).
+  registry: ghcr.io
+  repository: onp
+  # tag empty -> falls back to .Chart.AppVersion (see _helpers.tpl onp.image).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+controller:
+  name: onp-controller
+  replicas: 1
+  # How long to wait for a woken node to report Ready before failing.
+  bootTimeout: 10m
+  logLevel: info
+  # Single-replica by default; flip on when running >1 replica.
+  leaderElect: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+wolAgent:
+  name: onp-wol-agent
+  # Address the agent binds inside its (host) network namespace.
+  listenAddr: ":9119"
+  # Port the Service exposes and the controller dials.
+  port: 9119
+  logLevel: info
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 50m
+      memory: 32Mi
+
+# Placement applies to BOTH the controller and the wol-agent. They must run only
+# on always-on nodes: wakeable nodes are powered off, and the agent's magic
+# packet is an L2 broadcast that must originate from a node sharing the segment.
+placement:
+  nodeSelector:
+    onp.io/always-on: "true"
+  tolerations:
+    - operator: Exists

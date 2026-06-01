@@ -1,0 +1,47 @@
+ONP — On-Prem Node Provisioner has been installed as release "{{ .Release.Name }}"
+in namespace "{{ .Release.Namespace }}".
+
+Images (pulled anonymously from {{ .Values.image.registry }}):
+  controller: {{ include "onp.image" (dict "root" $ "name" .Values.controller.name) }}
+  wol-agent:  {{ include "onp.image" (dict "root" $ "name" .Values.wolAgent.name) }}
+
+1) Label every ALWAYS-ON node (control plane / nodes that never power off) so
+   the controller and wol-agent land there:
+
+     kubectl label node <always-on-node> onp.io/always-on=true
+
+   Verify both workloads scheduled:
+
+     kubectl -n {{ .Release.Namespace }} get deploy,ds,svc -l app.kubernetes.io/instance={{ .Release.Name }}
+
+2) Register a Machine for each WAKEABLE physical node. The Machine is cluster-
+   scoped; capacity is the source of truth for fit checks while the node is off:
+
+     apiVersion: onp.io/v1alpha1
+     kind: Machine
+     metadata:
+       name: worker-1
+     spec:
+       nodeName: worker-1
+       power:
+         provider: wol
+         wol:
+           macAddress: "aa:bb:cc:dd:ee:ff"
+           # broadcastAddress: 192.168.1.255   # optional; defaults to 255.255.255.255
+       capacity:
+         cpu: "8"
+         memory: 32Gi
+
+3) Trigger a wake (Phase 1 / M2 manual path) with the annotation:
+
+     kubectl annotate machine worker-1 onp.io/wake-now=true
+
+   Follow the lifecycle:
+
+     kubectl get machines
+     kubectl describe machine worker-1
+
+Notes:
+- The wol-agent runs hostNetwork on always-on nodes because Wake-on-LAN magic
+  packets are L2 broadcasts and must originate on the target node's segment.
+- The wol-agent holds NO Kubernetes API permissions by design.

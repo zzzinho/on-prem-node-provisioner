@@ -1,0 +1,21 @@
+# Stable name the controller dials via --wol-agent-endpoint. Because the agent
+# pods are hostNetwork, the Service routes to a pod's host IP on the named port;
+# any always-on agent can broadcast, so a single ClusterIP fronting them is fine.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "onp.fullname" . }}-wol-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wol-agent
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "onp.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: wol-agent
+  ports:
+  - name: wake
+    port: {{ .Values.wolAgent.port }}
+    targetPort: wake
+    protocol: TCP

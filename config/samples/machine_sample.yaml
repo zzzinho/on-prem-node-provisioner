@@ -1,0 +1,20 @@
+apiVersion: onp.io/v1alpha1
+kind: Machine
+metadata:
+  name: node-sample
+  labels:
+    onp.io/pool: sample
+spec:
+  nodeName: node-sample
+  capacity:
+    cpu: "8"
+    memory: 16Gi
+  labels:
+    onp.io/sample: "true"
+  power:
+    provider: wol
+    wol:
+      macAddress: "aa:bb:cc:dd:ee:ff"
+      broadcastAddress: "192.168.1.255"
+  shutdown:
+    provider: agent
