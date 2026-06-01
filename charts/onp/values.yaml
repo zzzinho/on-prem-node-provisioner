@@ -2,7 +2,9 @@
 # common repository prefix: <registry>/<repository>/<component>:<tag>.
 # Anonymous pull is enabled on the registry, so no imagePullSecrets are needed.
 image:
-  registry: oci.wwwlsgh.app
+  # Defaults to GitHub Container Registry. Override for your own registry, e.g.
+  #   --set image.registry=<your-registry>   (or a local -f values file).
+  registry: ghcr.io
   repository: onp
   # tag empty -> falls back to .Chart.AppVersion (see _helpers.tpl onp.image).
   tag: ""

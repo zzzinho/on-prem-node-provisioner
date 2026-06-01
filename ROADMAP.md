@@ -32,7 +32,7 @@
 ## Phase 0 — 설계 ✅
 
 - [x] 프로젝트 이름 확정 (`wolscaler` → `ONP`)
-- [x] 디렉터리 rename (`/Users/jeongjinho/code/wolscaler` → `/Users/jeongjinho/code/onp`)
+- [x] 디렉터리 rename (`wolscaler` → `onp`)
 - [x] `docs/DESIGN.md` — Google 스타일 디자인 doc (5 섹션, mermaid 5개)
 - [x] `CLAUDE.md` — 코드 작성 시 자동 로드되는 한 페이지 가이드
 - [x] TODO 를 수직 슬라이스 구조로 재구성
@@ -75,9 +75,9 @@
 
 - 스캐폴딩: **controller-gen + controller-runtime 직접 레이아웃** (kubebuilder full init 아님 — 멀티 바이너리·기존 파일 보존, 의존성 가볍게).
 - 컨트롤러 → wol-agent 전송: **HTTP/JSON (표준 라이브러리)**. `PowerProvider` 구현 내부에 숨겨 추후 교체 가능 (`DESIGN.md` 3.3 갱신됨).
-- 이미지 배포: **자체 zot 레지스트리 `oci.wwwlsgh.app/onp/...`** (microk8s containerd 익명 pull, pullSecret 불필요).
+- 이미지 배포: **자체 zot OCI 레지스트리 (`<registry>/onp/...`)** (microk8s containerd 익명 pull, pullSecret 불필요).
 - 배포 방식: **Helm 차트 (`charts/onp/`)** — M2 부터 도입하고 마일스톤마다 컴포넌트를 더한다 (M4 shutdown-agent, M5 PSA·packaging). 생 manifest 는 두지 않는다.
-- 검증 대상: **실제 microk8s + `desktop1`** (kind 아님).
+- 검증 대상: **실제 microk8s 클러스터의 물리 노드** (kind 아님).
 - `bootTimeout`: 컨트롤러 플래그 `--boot-timeout=10m` 상수. NodePool 이동은 M3.
 - Leader election: M2 는 1 replica, Lease 는 M5.
 
@@ -96,7 +96,7 @@
 - [x] `internal/power/wol/{wire.go, client.go}` — **순수(k8s-free)** wire 타입 + agent HTTP 클라이언트
 - [x] `internal/power/wolprovider.go` — `*Machine` 결합 wol provider, capabilities `{CanPowerOn: true}` (agent 경량화 위해 순수 `wol` 패키지와 분리 — ROADMAP 원안의 `wol/provider.go` 에서 변경)
 - [x] `internal/agent/server.go` + `cmd/onp-wol-agent/main.go` — hostNetwork HTTP `POST /wake` → `wol.Send`(M1), slog 로깅, **k8s 의존성 0**
-- [x] ✅ 체크포인트: `desktop` 노드에서 agent 가 실제 LAN broadcast 송신 (204 + JSON 로그) 검증 완료
+- [x] ✅ 체크포인트: 같은 L2 의 항상-켜진 노드에서 agent 가 실제 LAN broadcast 송신 (204 + JSON 로그) 검증 완료
 
 #### M2.2 — reconciler wake 경로
 
@@ -107,7 +107,7 @@
   - 컨트롤러 재시작에도 idempotent (source of truth = `status.state`)
 - [x] `internal/controller/machine_controller_test.go` — **fake client + fake clock/provider**, 5개 전이 케이스 (envtest 대신 hermetic)
 - [x] RBAC(`config/rbac/role.yaml`) 생성, `status.bootStartTime` CRD 필드 추가
-- [x] ✅ 체크포인트: microk8s 에서 `desktop1` Machine 어노테이션 → `Off → Booting → Ready` 라이브 검증 (Events 로 확인)
+- [x] ✅ 체크포인트: 실제 클러스터에서 타깃 노드 Machine 어노테이션 → `Off → Booting → Ready` 라이브 검증 (Events 로 확인)
 
 #### M2.3 — Helm 차트 + 배포 + E2E
 
@@ -116,9 +116,9 @@
   - `templates/` — controller Deployment, wol-agent DaemonSet(`hostNetwork: true`, `onp.io/always-on` nodeSelector) + Service(ClusterIP 9119), ClusterRole/Binding + SA, hardened securityContext(nonroot·drop ALL·readonly fs)
   - `values.yaml` — 이미지 registry/repo/tag, placement(nodeSelector/toleration), `bootTimeout`
 - [x] 파라미터화 `Dockerfile` (`--build-arg BIN`, `distroless/static:nonroot`, `$BUILDPLATFORM` 크로스컴파일) — controller/agent/wol-probe 공용
-- [x] 이미지 빌드/푸시 → `oci.wwwlsgh.app/onp/{onp-controller,onp-wol-agent}:0.1.0` (익명 pull)
+- [x] 이미지 빌드/푸시 → `<registry>/onp/{onp-controller,onp-wol-agent}:0.1.0` (자체 레지스트리, 익명 pull)
 - [x] `securityContext.runAsUser: 65532` — distroless `USER nonroot`(비숫자) + `runAsNonRoot` 검증 이슈 해결
-- [x] ✅ **검증 (E2E)**: `helm install onp ./charts/onp -n onp-system` → microk8s 배포(controller Deployment + wol-agent DaemonSet) → Machine 어노테이션 → **배포된 controller→Service→agent 가 실제 패킷 송신**, `Off→Booting→Ready`(Events). 물리 wake(desktop1 OFF→부팅)는 M2.2 후속에서 별도 실증.
+- [x] ✅ **검증 (E2E)**: `helm install onp ./charts/onp -n onp-system` → microk8s 배포(controller Deployment + wol-agent DaemonSet) → Machine 어노테이션 → **배포된 controller→Service→agent 가 실제 패킷 송신**, `Off→Booting→Ready`(Events). 물리 wake(타깃 노드 OFF→부팅)는 별도로 실증.
 
 ---
 
