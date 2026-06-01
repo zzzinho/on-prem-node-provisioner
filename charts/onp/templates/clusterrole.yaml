@@ -1,0 +1,44 @@
+# Rules mirror config/rbac/role.yaml verbatim — the least privilege the
+# controller needs: read Nodes, reconcile Machines and their status, emit Events.
+# The wol-agent has NO ClusterRole/binding: it never touches the k8s API.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "onp.fullname" . }}-controller
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - onp.io
+  resources:
+  - machines
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - onp.io
+  resources:
+  - machines/status
+  verbs:
+  - get
+  - patch
+  - update

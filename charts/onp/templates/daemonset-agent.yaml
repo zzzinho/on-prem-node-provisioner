@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "onp.fullname" . }}-wol-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wol-agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "onp.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: wol-agent
+  template:
+    metadata:
+      labels:
+        {{- include "onp.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: wol-agent
+    spec:
+      serviceAccountName: {{ include "onp.fullname" . }}-wol-agent
+      # The magic packet is an L2 broadcast: it must leave a NIC on the target's
+      # segment, so the agent shares the host network namespace. ClusterFirstWithHostNet
+      # keeps cluster DNS working despite hostNetwork.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.placement.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.placement.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        # distroless:nonroot's UID/GID. Numeric so the kubelet can verify non-root;
+        # the image's "USER nonroot" name alone is unverifiable under runAsNonRoot.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: wol-agent
+        image: {{ include "onp.image" (dict "root" $ "name" .Values.wolAgent.name) }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        - --listen-addr={{ .Values.wolAgent.listenAddr }}
+        - --log-level={{ .Values.wolAgent.logLevel }}
+        ports:
+        - name: wake
+          containerPort: {{ .Values.wolAgent.port }}
+          hostPort: {{ .Values.wolAgent.port }}
+          protocol: TCP
+        # Broadcasting to 255.255.255.255 needs no Linux capability; the socket
+        # SO_BROADCAST option is enough. So no privileged, no added caps.
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          {{- toYaml .Values.wolAgent.resources | nindent 10 }}

@@ -75,7 +75,7 @@
 
 - 스캐폴딩: **controller-gen + controller-runtime 직접 레이아웃** (kubebuilder full init 아님 — 멀티 바이너리·기존 파일 보존, 의존성 가볍게).
 - 컨트롤러 → wol-agent 전송: **HTTP/JSON (표준 라이브러리)**. `PowerProvider` 구현 내부에 숨겨 추후 교체 가능 (`DESIGN.md` 3.3 갱신됨).
-- 이미지 배포: **`ghcr.io/zzzinho/...` 퍼블릭 이미지** (클러스터가 그냥 pull).
+- 이미지 배포: **자체 zot 레지스트리 `oci.wwwlsgh.app/onp/...`** (microk8s containerd 익명 pull, pullSecret 불필요).
 - 배포 방식: **Helm 차트 (`charts/onp/`)** — M2 부터 도입하고 마일스톤마다 컴포넌트를 더한다 (M4 shutdown-agent, M5 PSA·packaging). 생 manifest 는 두지 않는다.
 - 검증 대상: **실제 microk8s + `desktop1`** (kind 아님).
 - `bootTimeout`: 컨트롤러 플래그 `--boot-timeout=10m` 상수. NodePool 이동은 M3.
@@ -111,14 +111,14 @@
 
 #### M2.3 — Helm 차트 + 배포 + E2E
 
-- [ ] `charts/onp/` Helm 차트:
-  - `crds/onp.io_machines.yaml` — controller-gen 생성 CRD (Helm `crds/` 규약)
-  - `templates/` — controller Deployment, wol-agent DaemonSet(`hostNetwork: true`, 컨트롤 플레인 nodeSelector) + Service, RBAC(controller: Machine RW/status·Node read·Events; agent: API 권한 없음) + ServiceAccount
-  - `values.yaml` — 이미지 repo/tag, nodeSelector/toleration, `bootTimeout`
-- [ ] `make` 타깃으로 controller-gen 산출물(CRD)을 차트 `crds/` 로 동기화
-- [ ] ghcr 이미지 빌드/푸시 (M1 Dockerfile 확장, multi-stage)
-- [ ] `examples/machine.yaml` — 샘플 Machine (차트 밖)
-- [ ] ✅ **검증 (E2E)**: `helm install onp ./charts/onp` → microk8s 배포 → `desktop1` Machine 등록 → 어노테이션으로 깨움 → `Off → Booting → Ready` 관찰
+- [x] `charts/onp/` Helm 차트:
+  - `crds/onp.io_machines.yaml` — 생성 CRD 복사 (Helm `crds/` 규약, byte-identical)
+  - `templates/` — controller Deployment, wol-agent DaemonSet(`hostNetwork: true`, `onp.io/always-on` nodeSelector) + Service(ClusterIP 9119), ClusterRole/Binding + SA, hardened securityContext(nonroot·drop ALL·readonly fs)
+  - `values.yaml` — 이미지 registry/repo/tag, placement(nodeSelector/toleration), `bootTimeout`
+- [x] 파라미터화 `Dockerfile` (`--build-arg BIN`, `distroless/static:nonroot`, `$BUILDPLATFORM` 크로스컴파일) — controller/agent/wol-probe 공용
+- [x] 이미지 빌드/푸시 → `oci.wwwlsgh.app/onp/{onp-controller,onp-wol-agent}:0.1.0` (익명 pull)
+- [x] `securityContext.runAsUser: 65532` — distroless `USER nonroot`(비숫자) + `runAsNonRoot` 검증 이슈 해결
+- [x] ✅ **검증 (E2E)**: `helm install onp ./charts/onp -n onp-system` → microk8s 배포(controller Deployment + wol-agent DaemonSet) → Machine 어노테이션 → **배포된 controller→Service→agent 가 실제 패킷 송신**, `Off→Booting→Ready`(Events). 물리 wake(desktop1 OFF→부팅)는 M2.2 후속에서 별도 실증.
 
 ---
 
