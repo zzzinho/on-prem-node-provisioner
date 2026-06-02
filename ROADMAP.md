@@ -128,9 +128,9 @@
 
 - [x] `api/v1alpha1/nodepool_types.go` — NodePool CRD 전체 스키마 (`minNodes`/`maxNodes`/`machineSelector`/`template`/`disruption`/`cooldown`/`drain` — M3 미사용 필드는 전방호환 자리, cluster-scoped `np`)
 - [x] NodePool reconciler — `machineSelector` 멤버십 → `status.totalMachines`/`readyMachines` 집계 (fake client 테스트 + 라이브 검증 `total=2 ready=1`)
-- [ ] Pod watcher — `PodScheduled=False, Reason=Unschedulable` 만 큐잉
-- [ ] Fit checker (`internal/scheduler/fit.go`) — 리소스 + nodeSelector + tolerations + required nodeAffinity. kube-scheduler framework 의존 X.
-- [ ] 후보 Machine 선정 로직: off 상태 + pool 멤버 + fit pass → best-fit (가장 작은 capacity 우선)
+- [x] Pod watcher — `PodScheduled=False, Reason=Unschedulable` 만 큐잉 (predicate 필터)
+- [x] Fit checker (`internal/scheduler/fit.go`) — 리소스 + nodeSelector + tolerations + required nodeAffinity. kube-scheduler framework 의존 X (predicate 는 `k8s.io/component-helpers` 위임, 17개 단위 테스트)
+- [x] 후보 Machine 선정 로직: off 상태 + pool 멤버 + fit pass → best-fit (가장 작은 capacity 우선) + in-flight 가드(중복 wake 방지), 어노테이션 트리거로 M2.2 wake 경로 재사용
 - [ ] `maxNodes`, `cooldown.scaleUp` 적용
 - [ ] **검증 (E2E #1)**: 풀의 모든 노드 끄기 → `kubectl run pod ...` → 자동 wake + 스케줄 확인
 
