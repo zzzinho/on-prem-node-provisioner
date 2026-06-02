@@ -133,6 +133,7 @@ func main() {
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("onp-controller"),
+		Clock:    clock.RealClock{},
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up scale-up reconciler")
 		os.Exit(1)

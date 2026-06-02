@@ -119,6 +119,11 @@ type NodePoolStatus struct {
 	// +optional
 	ReadyMachines int32 `json:"readyMachines"`
 
+	// LastScaleUpTime is when ONP most recently woke a Machine in this pool; it
+	// anchors cooldown.scaleUp rate-limiting. Nil means no scale-up yet.
+	// +optional
+	LastScaleUpTime *metav1.Time `json:"lastScaleUpTime,omitempty"`
+
 	// Conditions follow the standard Kubernetes condition pattern.
 	// +listType=map
 	// +listMapKey=type

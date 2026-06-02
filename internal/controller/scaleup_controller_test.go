@@ -2,18 +2,25 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
 )
+
+// scaleUpBase is the fixed wall-clock instant the fake clock starts at, so
+// cooldown math in tests is deterministic and easy to read.
+var scaleUpBase = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
 // scaleMachine builds a pool-member Machine with a CPU/memory capacity and state
 // for scale-up tests. Labels place it in a pool; capacity drives the fit check
@@ -71,9 +78,11 @@ func newScaleUpReconciler(t *testing.T, rec record.EventRecorder, objs ...client
 	scheme := newScheme(t)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.NodePool{}).
 		WithObjects(objs...).
 		Build()
-	return &ScaleUpReconciler{Client: cl, Scheme: scheme, Recorder: rec}, cl
+	clk := clocktesting.NewFakePassiveClock(scaleUpBase)
+	return &ScaleUpReconciler{Client: cl, Scheme: scheme, Recorder: rec, Clock: clk}, cl
 }
 
 // wokenMachines returns the names of Machines carrying the wake-now trigger.
@@ -205,5 +214,175 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 				t.Errorf("event recorded = %v, want %v", gotEvent, tt.wantEvent)
 			}
 		})
+	}
+}
+
+// gpuPoolWithGuards builds the gpu pool with optional maxNodes / cooldown.scaleUp
+// guards and a status.lastScaleUpTime anchor. A nil arg leaves that guard unset.
+func gpuPoolWithGuards(maxNodes *int32, cooldown *time.Duration, lastScaleUp *time.Time) *v1alpha1.NodePool {
+	pool := gpuPool()
+	pool.Spec.MaxNodes = maxNodes
+	if cooldown != nil {
+		pool.Spec.Cooldown.ScaleUp = &metav1.Duration{Duration: *cooldown}
+	}
+	if lastScaleUp != nil {
+		t := metav1.NewTime(*lastScaleUp)
+		pool.Status.LastScaleUpTime = &t
+	}
+	return pool
+}
+
+func int32Ptr(v int32) *int32               { return &v }
+func durPtr(d time.Duration) *time.Duration { return &d }
+func timePtr(t time.Time) *time.Time        { return &t }
+
+// TestScaleUpGuards covers the M3.3 per-pool guards: maxNodes caps powered-on
+// nodes and cooldown.scaleUp rate-limits successive wakes within a pool.
+func TestScaleUpGuards(t *testing.T) {
+	t.Parallel()
+
+	gpu := map[string]string{"onp.io/pool": "gpu"}
+
+	tests := []struct {
+		name             string
+		pool             *v1alpha1.NodePool
+		machines         []client.Object
+		wantWoken        []string
+		wantRequeue      time.Duration // 0 means do not assert an exact value
+		wantBlockedEvent bool          // ScaleUpBlocked Warning on the Pod
+	}{
+		{
+			name: "maxNodes at cap: off member not woken",
+			pool: gpuPoolWithGuards(int32Ptr(1), nil, nil),
+			machines: []client.Object{
+				scaleMachine("ready", gpu, "4", "8Gi", v1alpha1.MachineStateReady),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken:        nil,
+			wantBlockedEvent: true,
+		},
+		{
+			name: "maxNodes under cap: off member woken",
+			pool: gpuPoolWithGuards(int32Ptr(2), nil, nil),
+			machines: []client.Object{
+				scaleMachine("ready", gpu, "4", "8Gi", v1alpha1.MachineStateReady),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: []string{"idle"},
+		},
+		{
+			name: "cooldown active: off member not woken, requeue at expiry",
+			pool: gpuPoolWithGuards(nil, durPtr(5*time.Minute), timePtr(scaleUpBase.Add(-1*time.Minute))),
+			machines: []client.Object{
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken:   nil,
+			wantRequeue: 4 * time.Minute,
+		},
+		{
+			name: "cooldown elapsed: off member woken",
+			pool: gpuPoolWithGuards(nil, durPtr(5*time.Minute), timePtr(scaleUpBase.Add(-6*time.Minute))),
+			machines: []client.Object{
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: []string{"idle"},
+		},
+		{
+			name: "nil maxNodes and nil cooldown: unchanged M3.2 wake",
+			pool: gpuPoolWithGuards(nil, nil, nil),
+			machines: []client.Object{
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: []string{"idle"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := record.NewFakeRecorder(16)
+			objs := append([]client.Object{tt.pool, pendingPod("1", "1Gi", true)}, tt.machines...)
+			r, cl := newScaleUpReconciler(t, rec, objs...)
+
+			res, err := r.Reconcile(context.Background(), reconcile.Request{
+				NamespacedName: client.ObjectKey{Namespace: "default", Name: "p"},
+			})
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+
+			woken := wokenMachines(t, cl)
+			want := map[string]bool{}
+			for _, n := range tt.wantWoken {
+				want[n] = true
+			}
+			if len(woken) != len(want) {
+				t.Fatalf("woken machines = %v, want %v", woken, want)
+			}
+			for n := range want {
+				if !woken[n] {
+					t.Errorf("machine %q not woken, want woken (woken=%v)", n, woken)
+				}
+			}
+
+			if tt.wantRequeue != 0 && res.RequeueAfter != tt.wantRequeue {
+				t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, tt.wantRequeue)
+			}
+
+			if got := blockedEventRecorded(rec); got != tt.wantBlockedEvent {
+				t.Errorf("ScaleUpBlocked event = %v, want %v", got, tt.wantBlockedEvent)
+			}
+		})
+	}
+}
+
+// blockedEventRecorded reports whether a ScaleUpBlocked Warning was emitted.
+func blockedEventRecorded(rec *record.FakeRecorder) bool {
+	for {
+		select {
+		case e := <-rec.Events:
+			if strings.Contains(e, reasonScaleUpBlocked) {
+				return true
+			}
+		default:
+			return false
+		}
+	}
+}
+
+// TestScaleUpStampsCooldownOnWake verifies a successful wake stamps the winning
+// pool's status.lastScaleUpTime to the clock's now, anchoring future cooldowns.
+func TestScaleUpStampsCooldownOnWake(t *testing.T) {
+	t.Parallel()
+
+	gpu := map[string]string{"onp.io/pool": "gpu"}
+	rec := record.NewFakeRecorder(16)
+	pool := gpuPoolWithGuards(nil, durPtr(5*time.Minute), nil) // cooldown set, never scaled up yet
+	r, cl := newScaleUpReconciler(t, rec,
+		pool,
+		pendingPod("1", "1Gi", true),
+		scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+	)
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: client.ObjectKey{Namespace: "default", Name: "p"},
+	}); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	if woken := wokenMachines(t, cl); !woken["idle"] {
+		t.Fatalf("machine %q not woken, want woken (woken=%v)", "idle", woken)
+	}
+
+	var got v1alpha1.NodePool
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "gpu"}, &got); err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if got.Status.LastScaleUpTime == nil {
+		t.Fatalf("LastScaleUpTime not stamped, want %v", scaleUpBase)
+	}
+	if !got.Status.LastScaleUpTime.Time.Equal(scaleUpBase) {
+		t.Errorf("LastScaleUpTime = %v, want %v", got.Status.LastScaleUpTime.Time, scaleUpBase)
 	}
 }

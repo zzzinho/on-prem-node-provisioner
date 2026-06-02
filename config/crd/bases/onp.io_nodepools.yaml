@@ -293,6 +293,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastScaleUpTime:
+                description: |-
+                  LastScaleUpTime is when ONP most recently woke a Machine in this pool; it
+                  anchors cooldown.scaleUp rate-limiting. Nil means no scale-up yet.
+                format: date-time
+                type: string
               readyMachines:
                 description: |-
                   ReadyMachines is the number of matching Machines whose status.state is
