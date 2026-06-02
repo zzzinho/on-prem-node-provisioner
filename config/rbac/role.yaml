@@ -23,6 +23,7 @@ rules:
   - onp.io
   resources:
   - machines
+  - nodepools
   verbs:
   - get
   - list
@@ -33,6 +34,7 @@ rules:
   - onp.io
   resources:
   - machines/status
+  - nodepools/status
   verbs:
   - get
   - patch

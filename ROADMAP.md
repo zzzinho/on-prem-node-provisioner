@@ -126,8 +126,8 @@
 
 **Definition of Done**: 풀의 모든 노드를 꺼둔 상태에서 Pod 을 apply 하면, 적합한 Machine 이 **자동으로** 깨어나고 Pod 가 스케줄된다. 어노테이션 불필요.
 
-- [ ] `api/v1alpha1/nodepool_types.go` — 최소 필드 (`minNodes`, `maxNodes`, `machineSelector`, `template`, `cooldown.scaleUp`)
-- [ ] NodePool reconciler — pool 멤버십 갱신, `status.totalMachines`
+- [x] `api/v1alpha1/nodepool_types.go` — NodePool CRD 전체 스키마 (`minNodes`/`maxNodes`/`machineSelector`/`template`/`disruption`/`cooldown`/`drain` — M3 미사용 필드는 전방호환 자리, cluster-scoped `np`)
+- [x] NodePool reconciler — `machineSelector` 멤버십 → `status.totalMachines`/`readyMachines` 집계 (fake client 테스트 + 라이브 검증 `total=2 ready=1`)
 - [ ] Pod watcher — `PodScheduled=False, Reason=Unschedulable` 만 큐잉
 - [ ] Fit checker (`internal/scheduler/fit.go`) — 리소스 + nodeSelector + tolerations + required nodeAffinity. kube-scheduler framework 의존 X.
 - [ ] 후보 Machine 선정 로직: off 상태 + pool 멤버 + fit pass → best-fit (가장 작은 capacity 우선)
