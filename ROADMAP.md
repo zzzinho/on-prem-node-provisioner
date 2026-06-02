@@ -132,7 +132,9 @@
 - [x] Fit checker (`internal/scheduler/fit.go`) — 리소스 + nodeSelector + tolerations + required nodeAffinity. kube-scheduler framework 의존 X (predicate 는 `k8s.io/component-helpers` 위임, 17개 단위 테스트)
 - [x] 후보 Machine 선정 로직: off 상태 + pool 멤버 + fit pass → best-fit (가장 작은 capacity 우선) + in-flight 가드(중복 wake 방지), 어노테이션 트리거로 M2.2 wake 경로 재사용
 - [x] `maxNodes`, `cooldown.scaleUp` 적용 (per-pool 가드, cooldown 은 `NodePool.status.lastScaleUpTime` 앵커 + 정확한 requeue, fake-clock 테스트)
-- [ ] **검증 (E2E #1)**: 풀의 모든 노드 끄기 → `kubectl run pod ...` → 자동 wake + 스케줄 확인
+- [~] **검증 (E2E #1)**: 풀의 모든 노드 끄기 → `kubectl run pod ...` → 자동 wake + 스케줄 확인
+  - ONP 제어 경로는 라이브로 검증됨(0.2.0 배포): unschedulable 파드 → scaleup 이 best-fit Machine 선정 → `wake-now` → MachineReconciler PowerOn → wol-agent 매직 패킷 송신 (Off→Booting 3초 내, agent 로그 `wake packet sent` 확인).
+  - **남은 블로커(ONP 외부)**: 타깃 노드가 물리적으로 부팅 안 됨 — 노드 NIC 의 WoL 무장이 풀린 상태(같은 LAN 에서 직접 쏜 동일 매직 패킷에도 무반응으로 확인). 노드 BIOS/ethtool WoL 무장 후 재검증 필요. bootTimeout(10m) 경과 시 Machine 은 설계대로 `Failed` 로 전이.
 
 ---
 
