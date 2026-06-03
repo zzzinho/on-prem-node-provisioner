@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -89,6 +90,19 @@ func readyNode(name string) *corev1.Node {
 	}
 }
 
+// notReadyNode returns a Node with Ready=False, as a powered-off node reports
+// once the kubelet stops heartbeating.
+func notReadyNode(name string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+}
+
 type reconcilerFixture struct {
 	r        *MachineReconciler
 	cl       client.Client
@@ -145,6 +159,11 @@ func (f *reconcilerFixture) getMachine(t *testing.T) *v1alpha1.Machine {
 		t.Fatalf("get machine: %v", err)
 	}
 	return &m
+}
+
+// condition returns the named status condition, or nil when absent.
+func condition(m *v1alpha1.Machine, condType string) *metav1.Condition {
+	return meta.FindStatusCondition(m.Status.Conditions, condType)
 }
 
 func TestReconcileOffWithWakeAnnotationPowersOn(t *testing.T) {
@@ -243,6 +262,43 @@ func TestReconcileOffPowerOnErrorStaysOff(t *testing.T) {
 	}
 	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateBooting {
 		t.Errorf("state after retry = %q, want %q", got.Status.State, v1alpha1.MachineStateBooting)
+	}
+}
+
+func TestReconcileShuttingDownNodeNotReadyBecomesOff(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	f := newFixture(t, m, notReadyNode("node-a"))
+
+	res := f.reconcile(t)
+
+	if res.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v, want 0 (node is gone, no need to poll)", res.RequeueAfter)
+	}
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateOff {
+		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateOff)
+	}
+	cond := condition(got, v1alpha1.ConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Errorf("Ready condition = %+v, want status False", cond)
+	}
+}
+
+func TestReconcileShuttingDownNodeStillReadyKeepsPolling(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	f := newFixture(t, m, readyNode("node-a"))
+
+	res := f.reconcile(t)
+
+	if res.RequeueAfter != shutdownPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v (poweroff not observed yet)", res.RequeueAfter, shutdownPollInterval)
+	}
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateShuttingDown {
+		t.Errorf("state = %q, want %q (must stay until Node goes NotReady)", got.Status.State, v1alpha1.MachineStateShuttingDown)
 	}
 }
 

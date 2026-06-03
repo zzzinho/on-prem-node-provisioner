@@ -52,7 +52,13 @@ const (
 	reasonBootTimeout     = "BootTimeout"
 	reasonUnknownProvider = "UnknownProvider"
 	reasonCannotPowerOn   = "CannotPowerOn"
+	reasonPoweredOff      = "PoweredOff"
 )
+
+// shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
+// while we wait for its Node to go NotReady, in case the Node watch misses the
+// transition. It mirrors bootPollInterval on the wake path.
+const shutdownPollInterval = 15 * time.Second
 
 // MachineReconciler advances Machine.status.state along the wake path.
 type MachineReconciler struct {
@@ -95,8 +101,10 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.reconcileBooting(ctx, &m)
 	case v1alpha1.MachineStateReady:
 		return r.reconcileReady(ctx, &m)
+	case v1alpha1.MachineStateShuttingDown:
+		return r.reconcileShuttingDown(ctx, &m)
 	default:
-		// Failed, Draining, ShuttingDown: not part of the M2.2 wake path.
+		// Failed, Draining: not part of the M2.2 wake path or the M4.0 shutdown leg.
 		logger.V(1).Info("no-op state", "state", m.Status.State)
 		return ctrl.Result{}, nil
 	}
@@ -209,6 +217,37 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 			return ctrl.Result{}, err
 		}
 	}
+	return ctrl.Result{}, nil
+}
+
+// reconcileShuttingDown finalizes the power-off leg. The shutdown-agent issues
+// the host poweroff in response to this same ShuttingDown state (coordination is
+// by CRD watch, not RPC — DESIGN.md 3.3); the controller's job here is to observe
+// the result. When the backing Node is no longer Ready (NotReady or the Node
+// object gone) the poweroff has taken effect, so we land the Machine in Off.
+// Until then we keep polling, because the Node going NotReady is the only signal
+// that the node actually went down.
+func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
+	}
+	if ready {
+		// Poweroff not observed yet. Requeue to keep polling; the Node watch will
+		// also enqueue us on the NotReady transition, this is the safety net.
+		// TODO(M4.1/M5): add a shutdown timeout that moves a stuck ShuttingDown
+		// Machine to Failed rather than polling forever.
+		return ctrl.Result{RequeueAfter: shutdownPollInterval}, nil
+	}
+
+	m.Status.State = v1alpha1.MachineStateOff
+	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonPoweredOff,
+		fmt.Sprintf("Node %q is no longer Ready; power-off complete", m.Spec.NodeName))
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("move machine %q to Off: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonPoweredOff,
+		"Node %q is no longer Ready; Machine is Off", m.Spec.NodeName)
 	return ctrl.Result{}, nil
 }
 

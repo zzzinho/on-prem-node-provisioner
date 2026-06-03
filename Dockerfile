@@ -27,10 +27,23 @@ ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${BIN}
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
+# ── Privileged runtime stage (onp-shutdown-agent) ────────────────────────────
+# The shutdown-agent powers the host off by entering PID 1's namespaces with
+# `nsenter` and running the host's `systemctl poweroff`. distroless ships no
+# nsenter, so this stage adds util-linux. It runs as root (the DaemonSet is
+# privileged) — nsenter into PID 1 needs it. Build with:
+#   --target runtime-privileged --build-arg BIN=onp-shutdown-agent
+FROM alpine:3.20 AS runtime-privileged
+RUN apk add --no-cache util-linux
+COPY --from=build /out/app /app
+ENTRYPOINT ["/app"]
+
+# ── Runtime stage (default: onp-controller, onp-wol-agent) ────────────────────
 # distroless/static:nonroot ships ca-certificates and a nonroot user, which the
 # controller needs for its in-cluster TLS client; the static binary needs nothing
 # more. wol-agent runs hostNetwork so its L2 broadcast reaches the LAN directly.
+# Last stage = default build target, so existing `--build-arg BIN=...` builds
+# (no --target) keep getting this minimal image.
 FROM gcr.io/distroless/static:nonroot AS runtime
 
 COPY --from=build /out/app /app

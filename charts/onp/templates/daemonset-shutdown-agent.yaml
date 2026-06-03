@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "onp.fullname" . }}-shutdown-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shutdown-agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "onp.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: shutdown-agent
+  template:
+    metadata:
+      labels:
+        {{- include "onp.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: shutdown-agent
+    spec:
+      serviceAccountName: {{ include "onp.fullname" . }}-shutdown-agent
+      # Powering the host off means entering PID 1's namespaces with nsenter and
+      # running the host's `systemctl poweroff`, which needs the host PID
+      # namespace and a privileged container.
+      hostPID: true
+      # Runs ONLY on ONP-managed (wakeable / shutdownable) nodes — never on
+      # always-on nodes. Label managed nodes to match.
+      {{- with .Values.shutdownAgent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.shutdownAgent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: shutdown-agent
+        image: {{ include "onp.image" (dict "root" $ "name" .Values.shutdownAgent.name) }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        - --log-level={{ .Values.shutdownAgent.logLevel }}
+        - --health-probe-bind-address=:8081
+        - --metrics-bind-address=:8080
+        env:
+        # The agent acts only on the Machine whose spec.nodeName matches this
+        # node; the downward API supplies the node name.
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # Privileged + host PID is the whole point: nsenter into PID 1 to run the
+        # host's poweroff. This is why the agent is isolated to managed nodes.
+        securityContext:
+          privileged: true
+        resources:
+          {{- toYaml .Values.shutdownAgent.resources | nindent 10 }}
