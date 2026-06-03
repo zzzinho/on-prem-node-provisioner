@@ -86,8 +86,13 @@ spec:
                   M3.0 only stores it.
                 properties:
                   consolidateAfter:
-                    description: ConsolidateAfter is how long a node must stay empty
-                      before it is drained.
+                    description: |-
+                      ConsolidateAfter is how long a node must stay continuously empty before ONP
+                      drains and powers it off. A nil pointer disables automatic scale-down for the
+                      pool even when consolidationPolicy is WhenEmpty: ONP will not power a node off
+                      without an explicit delay, so an operator never loses an idle node by leaving
+                      this unset (the "조용히 데이터를 잃는 기본값은 만들지 않는다" default). 0 means drain as
+                      soon as the node is observed empty.
                     type: string
                   consolidationPolicy:
                     description: |-

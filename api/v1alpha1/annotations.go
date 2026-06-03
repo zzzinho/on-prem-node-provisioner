@@ -12,6 +12,18 @@ const (
 	// AnnotationWakeNowValue is the value AnnotationWakeNow must hold to trigger
 	// a wake. Any other value (or absence) is treated as "do not wake".
 	AnnotationWakeNowValue = "true"
+
+	// AnnotationDrainNow, set to "true" on a Ready Machine, asks the controller
+	// to cordon and drain the node, then move it toward power-off. It mirrors
+	// AnnotationWakeNow: the controller treats it as a one-shot trigger and
+	// removes it once the drain starts, so a stale "true" does not re-drain a
+	// node the operator later wakes. Manual operators and the automatic
+	// ScaleDownReconciler (M4.2) set it on the same path.
+	AnnotationDrainNow = "onp.io/drain-now"
+
+	// AnnotationDrainNowValue is the value AnnotationDrainNow must hold to
+	// trigger a drain. Any other value (or absence) is treated as "do not drain".
+	AnnotationDrainNowValue = "true"
 )
 
 // Condition types ONP sets on Machine.status.conditions. They follow the
@@ -25,4 +37,10 @@ const (
 
 	// ConditionReady reports whether the backing Node is Ready and schedulable.
 	ConditionReady = "Ready"
+
+	// ConditionDrainSucceeded reports the outcome of the most recent drain. True
+	// means the node drained cleanly and is moving to ShuttingDown; False means
+	// the drain hit its timeout and the Machine was failed (the node is
+	// uncordoned), per the "stop, don't force" default.
+	ConditionDrainSucceeded = "DrainSucceeded"
 )

@@ -145,10 +145,10 @@
 - [x] `cmd/onp-shutdown-agent/` DaemonSet (`privileged: true`, hostPID) — M4.0
   - [x] 자기 호스트의 Machine 만 watch (predicate 필터, RBAC read-only `machines` get/list/watch)
   - [x] `state == ShuttingDown` 감지 시 `nsenter -t 1 systemctl poweroff` (graceful; 멱등 sync.Once)
-- [ ] `disruption.consolidationPolicy: WhenEmpty` + `consolidateAfter` 처리
-- [ ] Empty 노드 감지 (DaemonSet / static pod 제외)
-- [ ] cordon → Eviction API (PDB 존중) → `state=ShuttingDown`
-- [ ] `drain.timeoutSeconds` (기본 300s) 초과 시 `state=Failed` + uncordon + Event (`force=false` 기본)
+- [x] `disruption.consolidationPolicy: WhenEmpty` + `consolidateAfter` 처리 — M4.2 (`ScaleDownReconciler`: 빈 노드가 `consolidateAfter` 동안 유지되면 `onp.io/drain-now` 트리거 → M4.1 drain 경로 재사용. policy/consolidateAfter 둘 다 명시 opt-in 이어야 동작 — 둘 중 하나라도 없으면 자동 scale-down off)
+- [x] Empty 노드 감지 (DaemonSet / static pod 제외) — M4.2 (`status.emptySince` 앵커, drain 완료 판정과 동일한 evictable 정의 공유 — DaemonSet/mirror/terminating/finished 제외, fake-clock 단위 테스트)
+- [x] cordon → Eviction API (PDB 존중) → `state=ShuttingDown` — M4.1 (`onp.io/drain-now` 트리거, DaemonSet/mirror/terminating 제외, Eviction 주입형으로 단위 테스트)
+- [x] `drain.timeoutSeconds` (기본 300s, NodePool 해석) 초과 시 `state=Failed` + uncordon + Event (`force=false` 기본) — M4.1
 - [ ] PSA `privileged` 네임스페이스 격리 매니페스트
 - [x] Node NotReady 감지 시 `state=Off` 전이 — M4.0 (MachineReconciler `ShuttingDown→Off`, 실하드웨어 검증: agent `PoweringOff` → controller `PoweredOff`)
 - [ ] **검증 (E2E #2)**: 모든 Pod 삭제 → 일정 시간 후 빈 노드 자동 drain → 전원 OFF → `state=Off` 확인

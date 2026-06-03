@@ -15,9 +15,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -38,6 +40,11 @@ import (
 // index on the manager's cache.
 const IndexMachineNodeName = "spec.nodeName"
 
+// IndexPodNodeName is the field-index key over Pod.spec.nodeName. reconcileDraining
+// queries it to list a node's pods server-side rather than listing every pod in
+// the cluster and filtering. main.go registers the matching index on the cache.
+const IndexPodNodeName = "spec.nodeName"
+
 // bootPollInterval bounds how often a Booting Machine is re-reconciled while we
 // wait for its Node to go Ready, in case the Node watch misses the transition.
 // It is also the requeue floor when the remaining boot budget is larger.
@@ -53,12 +60,30 @@ const (
 	reasonUnknownProvider = "UnknownProvider"
 	reasonCannotPowerOn   = "CannotPowerOn"
 	reasonPoweredOff      = "PoweredOff"
+	reasonDraining        = "Draining"
+	reasonDrainSucceeded  = "DrainSucceeded"
+	reasonDrainTimeout    = "DrainTimeout"
 )
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
 // while we wait for its Node to go NotReady, in case the Node watch misses the
 // transition. It mirrors bootPollInterval on the wake path.
 const shutdownPollInterval = 15 * time.Second
+
+// drainPollInterval bounds how often a Draining Machine is re-reconciled while
+// evictions are in flight: after issuing evictions we requeue this often to
+// re-list the node and check whether it has emptied. It is also how often we
+// re-evaluate the drain timeout.
+const drainPollInterval = 10 * time.Second
+
+// defaultDrainTimeout is the drain budget used when the Machine's NodePool sets
+// no drain.timeoutSeconds (or no pool matches). It mirrors DESIGN.md 3.3.
+const defaultDrainTimeout = 300 * time.Second
+
+// mirrorPodAnnotation marks a static (mirror) pod created by a kubelet from a
+// manifest, not by the API server. Such pods cannot be evicted — deleting the
+// mirror does nothing to the static pod — so the drain skips them.
+const mirrorPodAnnotation = "kubernetes.io/config.mirror"
 
 // MachineReconciler advances Machine.status.state along the wake path.
 type MachineReconciler struct {
@@ -72,11 +97,21 @@ type MachineReconciler struct {
 	// drive it with a fake clock. A PassiveClock is enough — the timeout is
 	// evaluated each reconcile, not scheduled.
 	Clock clock.PassiveClock
+	// Evict issues a single pod eviction through the Eviction API. It is injected
+	// so tests can stub it: the fake client's eviction subresource deletes the
+	// pod unconditionally and never returns the PDB-blocked TooManyRequests we
+	// must handle, so a real eviction path is untestable against it. nil falls
+	// back to the controller-runtime Eviction subresource (wired in
+	// SetupWithManager).
+	Evict func(ctx context.Context, pod *corev1.Pod) error
 }
 
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile drives one Machine toward the correct state. It is a pure function
@@ -101,10 +136,12 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.reconcileBooting(ctx, &m)
 	case v1alpha1.MachineStateReady:
 		return r.reconcileReady(ctx, &m)
+	case v1alpha1.MachineStateDraining:
+		return r.reconcileDraining(ctx, &m)
 	case v1alpha1.MachineStateShuttingDown:
 		return r.reconcileShuttingDown(ctx, &m)
 	default:
-		// Failed, Draining: not part of the M2.2 wake path or the M4.0 shutdown leg.
+		// Failed: a terminal state an operator must resolve by hand.
 		logger.V(1).Info("no-op state", "state", m.Status.State)
 		return ctrl.Result{}, nil
 	}
@@ -209,15 +246,104 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 	return ctrl.Result{RequeueAfter: r.requeueForBoot(m)}, nil
 }
 
-// reconcileReady tidies a leftover wake-now annotation; Ready is otherwise
-// stable in M2.2.
+// reconcileReady tidies a leftover wake-now annotation and starts a drain when
+// the drain-now annotation is set. A drain-now on a non-Ready Machine is ignored
+// — only Ready -> Draining — so the trigger cannot interrupt a boot or a
+// power-off that is already in flight.
 func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
 	if _, ok := m.Annotations[v1alpha1.AnnotationWakeNow]; ok {
 		if err := r.removeWakeAnnotation(ctx, m); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
-	return ctrl.Result{}, nil
+
+	if !drainRequested(m) {
+		return ctrl.Result{}, nil
+	}
+
+	now := metav1.NewTime(r.Clock.Now())
+	m.Status.State = v1alpha1.MachineStateDraining
+	m.Status.DrainStartTime = &now
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("move machine %q to Draining: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonDraining,
+		"draining Node %q before power-off", m.Spec.NodeName)
+	// Clear the one-shot trigger so a stale "true" does not re-drain a node the
+	// operator later wakes, mirroring wake-now.
+	if err := r.removeDrainAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// reconcileDraining cordons the backing Node and evicts its workload, then moves
+// the Machine to ShuttingDown once the node is empty. On drain timeout it stops
+// — uncordon + Failed + Event — rather than force-evicting, per the
+// "조용히 데이터를 잃는 기본값은 만들지 않는다" default (DESIGN.md 3.3). The node stays
+// cordoned across Draining -> ShuttingDown -> Off; only the timeout path
+// uncordons.
+func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	timeout, err := r.drainTimeout(ctx, m)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Timeout first: a node that will not drain must stop before we touch any
+	// more pods, and the stop must uncordon so the operator can recover the node.
+	if r.drainTimedOut(m, timeout) {
+		if err := r.setCordon(ctx, m.Spec.NodeName, false); err != nil {
+			return ctrl.Result{}, err
+		}
+		m.Status.State = v1alpha1.MachineStateFailed
+		setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionFalse, reasonDrainTimeout,
+			fmt.Sprintf("Node %q did not drain within %s", m.Spec.NodeName, timeout))
+		if err := r.Status().Update(ctx, m); err != nil {
+			return ctrl.Result{}, fmt.Errorf("fail machine %q on drain timeout: %w", m.Name, err)
+		}
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainTimeout,
+			"Node %q did not drain within %s; uncordoned and marked Failed", m.Spec.NodeName, timeout)
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.setCordon(ctx, m.Spec.NodeName, true); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	pods, err := r.evictablePods(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("list evictable pods on node %q: %w", m.Spec.NodeName, err)
+	}
+
+	if len(pods) == 0 {
+		// Node is empty: hand off to the power-off leg. Leave it cordoned — it is
+		// on its way down, and reconcileShuttingDown + the agent finish it.
+		m.Status.State = v1alpha1.MachineStateShuttingDown
+		setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionTrue, reasonDrainSucceeded,
+			fmt.Sprintf("Node %q drained; powering off", m.Spec.NodeName))
+		if err := r.Status().Update(ctx, m); err != nil {
+			return ctrl.Result{}, fmt.Errorf("move machine %q to ShuttingDown: %w", m.Name, err)
+		}
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonDrainSucceeded,
+			"Node %q drained; moving to ShuttingDown", m.Spec.NodeName)
+		return ctrl.Result{}, nil
+	}
+
+	for i := range pods {
+		if err := r.evictPod(ctx, &pods[i]); err != nil {
+			if apierrors.IsTooManyRequests(err) {
+				// PDB blocked this eviction. Expected, not an error: keep draining
+				// and re-check after the poll interval; the timeout above is the
+				// backstop if the disruption budget never opens.
+				log.FromContext(ctx).V(1).Info("eviction blocked by disruption budget",
+					"pod", pods[i].Name, "node", m.Spec.NodeName)
+				continue
+			}
+			return ctrl.Result{}, fmt.Errorf("evict pod %q on node %q: %w", pods[i].Name, m.Spec.NodeName, err)
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: drainPollInterval}, nil
 }
 
 // reconcileShuttingDown finalizes the power-off leg. The shutdown-agent issues
@@ -282,6 +408,155 @@ func (r *MachineReconciler) bootTimedOut(m *v1alpha1.Machine) bool {
 	return r.Clock.Since(m.Status.BootStartTime.Time) >= r.BootTimeout
 }
 
+// drainTimedOut reports whether the Machine has been Draining longer than the
+// resolved timeout. A missing DrainStartTime is treated as not-yet-timed-out, by
+// the same half-written-status reasoning as bootTimedOut.
+func (r *MachineReconciler) drainTimedOut(m *v1alpha1.Machine, timeout time.Duration) bool {
+	if m.Status.DrainStartTime == nil {
+		return false
+	}
+	return r.Clock.Since(m.Status.DrainStartTime.Time) > timeout
+}
+
+// drainTimeout resolves the drain budget for a Machine from its NodePool's
+// drain.timeoutSeconds, falling back to defaultDrainTimeout when the pool sets
+// no timeout or no pool matches. The first matching pool wins; pool overlap is a
+// conflict surfaced elsewhere, not resolved here.
+func (r *MachineReconciler) drainTimeout(ctx context.Context, m *v1alpha1.Machine) (time.Duration, error) {
+	pool, err := poolForMachine(ctx, r.Client, m)
+	if err != nil {
+		return 0, err
+	}
+	if pool == nil || pool.Spec.Drain.TimeoutSeconds == nil {
+		return defaultDrainTimeout, nil
+	}
+	return time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second, nil
+}
+
+// poolForMachine returns the first NodePool whose machineSelector matches the
+// Machine's labels, or nil when none match. It mirrors NodePoolReconciler's
+// selector logic (metav1.LabelSelectorAsSelector + a labels.Set match); the pool
+// count is assumed small, so a full list per reconcile is acceptable. The drain
+// (timeout resolution) and scale-down (disruption policy) paths share it.
+func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (*v1alpha1.NodePool, error) {
+	var pools v1alpha1.NodePoolList
+	if err := c.List(ctx, &pools); err != nil {
+		return nil, fmt.Errorf("list nodepools for machine %q: %w", m.Name, err)
+	}
+	machineLabels := labels.Set(m.Labels)
+	for i := range pools.Items {
+		selector, err := metav1.LabelSelectorAsSelector(&pools.Items[i].Spec.MachineSelector)
+		if err != nil {
+			// A bad selector is the pool's own reconcile to report; skip it here.
+			continue
+		}
+		if selector.Matches(machineLabels) {
+			return &pools.Items[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// setCordon patches the Node's spec.unschedulable to the given value, leaving it
+// untouched when already in the desired state. A missing Node is not an error:
+// the cordon target may have gone away, in which case there is nothing to drain.
+func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) error {
+	if nodeName == "" {
+		return nil
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get node %q to cordon: %w", nodeName, err)
+	}
+	if node.Spec.Unschedulable == unschedulable {
+		return nil
+	}
+	patch := client.MergeFrom(node.DeepCopy())
+	node.Spec.Unschedulable = unschedulable
+	if err := r.Patch(ctx, &node, patch); err != nil {
+		return fmt.Errorf("set node %q unschedulable=%t: %w", nodeName, unschedulable, err)
+	}
+	return nil
+}
+
+// evictablePods lists the pods scheduled on the node and returns the ones a
+// drain must evict. See evictablePodsOnNode for the exclusion rules.
+func (r *MachineReconciler) evictablePods(ctx context.Context, nodeName string) ([]corev1.Pod, error) {
+	return evictablePodsOnNode(ctx, r.Client, nodeName)
+}
+
+// evictablePodsOnNode lists the pods scheduled on the node and returns the ones a
+// drain must evict — equivalently, the pods that make the node non-empty. It
+// excludes pods that eviction cannot or should not move: DaemonSet-owned pods
+// (rescheduled to the node regardless), mirror/static pods (not API-managed),
+// already-terminating pods, and finished pods. The drain loop (what to evict) and
+// the scale-down path (is the node empty) both read it, so a node is detected
+// "empty" by exactly the condition the drain later confirms. nodeName "" yields
+// no pods.
+func evictablePodsOnNode(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
+	if nodeName == "" {
+		return nil, nil
+	}
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
+		return nil, err
+	}
+	evictable := make([]corev1.Pod, 0, len(pods.Items))
+	for i := range pods.Items {
+		if isEvictable(&pods.Items[i]) {
+			evictable = append(evictable, pods.Items[i])
+		}
+	}
+	return evictable, nil
+}
+
+// evictPod issues one eviction through the injected Evict func, or the
+// controller-runtime Eviction subresource when none is wired.
+func (r *MachineReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error {
+	if r.Evict != nil {
+		return r.Evict(ctx, pod)
+	}
+	return evictViaSubResource(ctx, r.Client, pod)
+}
+
+// evictViaSubResource POSTs a policy/v1 Eviction for the pod through the
+// client's eviction subresource — the Eviction API, so PodDisruptionBudgets are
+// honored (a blocked eviction comes back as TooManyRequests). It never deletes
+// the pod directly. This is the default Evict wired in production.
+func evictViaSubResource(ctx context.Context, c client.Client, pod *corev1.Pod) error {
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+	}
+	return c.SubResource("eviction").Create(ctx, pod, eviction)
+}
+
+// isEvictable reports whether a drain should evict the pod. The exclusions match
+// kubectl drain's defaults for an unforced drain.
+func isEvictable(pod *corev1.Pod) bool {
+	if pod.DeletionTimestamp != nil {
+		return false
+	}
+	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return false
+	}
+	if _, ok := pod.Annotations[mirrorPodAnnotation]; ok {
+		return false
+	}
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return false
+		}
+	}
+	// TODO(M5): honor the onp.io/do-not-disrupt annotation here as a hard guard.
+	return true
+}
+
 // requeueForBoot returns how long to wait before re-reconciling a Booting
 // Machine: the smaller of the poll interval and the remaining boot budget, so
 // we wake up close to the deadline even when polling slower.
@@ -317,6 +592,26 @@ func (r *MachineReconciler) removeWakeAnnotation(ctx context.Context, m *v1alpha
 // value.
 func wakeRequested(m *v1alpha1.Machine) bool {
 	return m.Annotations[v1alpha1.AnnotationWakeNow] == v1alpha1.AnnotationWakeNowValue
+}
+
+// removeDrainAnnotation strips the one-shot drain trigger via a patch so the
+// removal does not clobber concurrent spec edits, mirroring removeWakeAnnotation.
+func (r *MachineReconciler) removeDrainAnnotation(ctx context.Context, m *v1alpha1.Machine) error {
+	if _, ok := m.Annotations[v1alpha1.AnnotationDrainNow]; !ok {
+		return nil
+	}
+	patch := client.MergeFrom(m.DeepCopy())
+	delete(m.Annotations, v1alpha1.AnnotationDrainNow)
+	if err := r.Patch(ctx, m, patch); err != nil {
+		return fmt.Errorf("remove drain-now annotation from machine %q: %w", m.Name, err)
+	}
+	return nil
+}
+
+// drainRequested reports whether the drain-now annotation is set to its trigger
+// value.
+func drainRequested(m *v1alpha1.Machine) bool {
+	return m.Annotations[v1alpha1.AnnotationDrainNow] == v1alpha1.AnnotationDrainNowValue
 }
 
 // setCondition writes a standard condition, stamping LastTransitionTime only on

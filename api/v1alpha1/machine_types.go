@@ -108,6 +108,27 @@ type MachineStatus struct {
 	// +optional
 	BootStartTime *metav1.Time `json:"bootStartTime,omitempty"`
 
+	// DrainStartTime is when the controller moved this Machine into Draining. It
+	// is the source of truth for the drain-timeout check, for the same reasons as
+	// BootStartTime: an explicit field (rather than a Condition's
+	// lastTransitionTime) keeps the timeout independent of unrelated condition
+	// updates and keeps reconcile idempotent across controller restarts.
+	// +optional
+	DrainStartTime *metav1.Time `json:"drainStartTime,omitempty"`
+
+	// EmptySince is when the scale-down path first observed this Machine's backing
+	// Node to be empty — carrying no evictable (non-DaemonSet, non-mirror, running)
+	// pods. It anchors the disruption.consolidateAfter timer: the Node must stay
+	// empty from this instant for that whole duration before ONP drains it. It is
+	// cleared the moment the Node is no longer empty or the Machine leaves Ready,
+	// so a node that briefly empties — or is later re-woken — starts a fresh timer
+	// rather than draining on a stale observation. Like BootStartTime and
+	// DrainStartTime it is an explicit field, not a Condition timestamp, to keep
+	// the timer independent of unrelated status churn and idempotent across
+	// controller restarts.
+	// +optional
+	EmptySince *metav1.Time `json:"emptySince,omitempty"`
+
 	// Conditions follow the standard Kubernetes condition pattern.
 	// +listType=map
 	// +listMapKey=type
