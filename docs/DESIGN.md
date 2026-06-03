@@ -262,6 +262,8 @@ sequenceDiagram
 
 `bootTimeout` (NodePool 설정, 기본 10분) 내에 Node Ready 가 관찰되지 않으면 컨트롤러는 `Machine.status.state = Failed` 로 옮기고 Event를 발생시킨다. 재시도 정책은 Phase 2.
 
+**Cordon 수명주기 (scale-down ↔ scale-up 연결).** scale-down 이 cordon 한 노드는 `Draining → ShuttingDown → Off` 내내 cordon 된 채로 전원이 꺼지고, 이후 scale-up 으로 다시 깨어나 `Ready` 가 될 때 컨트롤러가 자동으로 uncordon 한다. Phase 1 노드는 long-lived 라 같은 Node 객체가 재사용되므로, cordon 을 안 풀면 깨운 노드가 `unschedulable` 로 남아 정작 깨운 원인이 된 pending 파드를 못 받는다. 운영자가 손으로 cordon 한 노드까지 풀어버리지 않도록, ONP 는 자기가 cordon 할 때 Node 에 `onp.io/cordoned-by-onp` 마커를 달고 wake 시 **마커가 있는 노드만** uncordon 한다 (drain timeout 경로의 uncordon 도 같은 마커를 지운다). 클라우드 오토스케일러가 노드를 통째로 버리고 새로 만드는 것과 달리, on-prem 의 "같은 노드를 껐다 켠다" 모델에서 생기는 고유한 수명주기다.
+
 #### Scale-down
 
 ```mermaid

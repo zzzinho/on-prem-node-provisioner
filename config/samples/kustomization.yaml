@@ -1,0 +1,9 @@
+# Example ONP custom resources. Apply with:
+#   kubectl apply -k config/samples/
+# These carry placeholder values — edit nodeName / MAC / capacity for your nodes,
+# or keep your real cluster's CRs in a private, git-ignored *.local.yaml instead.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- onp_v1alpha1_nodepool.yaml
+- onp_v1alpha1_machine.yaml

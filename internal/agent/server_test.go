@@ -136,5 +136,35 @@ func TestHandlerAllowHeader(t *testing.T) {
 	}
 }
 
+// TestHandlerHealth checks /healthz and /readyz return 200 on GET (so the
+// kubelet's probes pass) and 405 on other methods.
+func TestHandlerHealth(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error { return nil }), nil))
+	defer srv.Close()
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		resp, err := srv.Client().Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s status = %d, want %d", path, resp.StatusCode, http.StatusOK)
+		}
+
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, nil)
+		pr, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		pr.Body.Close()
+		if pr.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s status = %d, want %d", path, pr.StatusCode, http.StatusMethodNotAllowed)
+		}
+	}
+}
+
 // guard ensures wol.Send keeps the signature the production Waker adapts.
 var _ = WakerFunc(wol.Send)

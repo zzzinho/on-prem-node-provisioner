@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "onp.fullname" . }}-shutdown-agent
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shutdown-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "onp.fullname" . }}-shutdown-agent
+subjects:
+- kind: ServiceAccount
+  name: {{ include "onp.fullname" . }}-shutdown-agent
+  namespace: {{ .Release.Namespace }}

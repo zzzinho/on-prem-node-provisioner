@@ -41,6 +41,26 @@ wolAgent:
       cpu: 50m
       memory: 32Mi
 
+# The shutdown-agent is a privileged DaemonSet on ONP-MANAGED nodes (the ones ONP
+# powers off). It watches its own node's Machine and runs `systemctl poweroff`
+# when that Machine reaches ShuttingDown. Unlike the wol-agent it is k8s-aware
+# (read-only Machine watch) and must NOT run on always-on nodes.
+shutdownAgent:
+  name: onp-shutdown-agent
+  logLevel: info
+  # Managed nodes must carry this label so the DaemonSet lands only on them.
+  nodeSelector:
+    onp.io/managed: "true"
+  tolerations:
+    - operator: Exists
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 50m
+      memory: 32Mi
+
 # Placement applies to BOTH the controller and the wol-agent. They must run only
 # on always-on nodes: wakeable nodes are powered off, and the agent's magic
 # packet is an L2 broadcast that must originate from a node sharing the segment.

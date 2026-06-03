@@ -1,0 +1,27 @@
+# Least privilege for the shutdown-agent: it only reads Machines (to observe its
+# own node reaching ShuttingDown) and emits Events. It never writes Machine state
+# — the controller owns the state machine. Machines are cluster-scoped, so this
+# is a ClusterRole; the agent filters to its own node in code.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "onp.fullname" . }}-shutdown-agent
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shutdown-agent
+rules:
+- apiGroups:
+  - onp.io
+  resources:
+  - machines
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch

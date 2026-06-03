@@ -90,5 +90,21 @@ func Handler(waker Waker, logger *slog.Logger) http.Handler {
 		)
 		w.WriteHeader(http.StatusNoContent)
 	})
+
+	// Liveness/readiness for the kubelet, on the same listener as /wake. The
+	// agent is stateless — it holds no connections and depends on nothing it
+	// could lose — so "the HTTP server is serving" is the only health signal, and
+	// readiness is not distinct from liveness. A 200 means up.
+	health := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+	mux.HandleFunc("/healthz", health)
+	mux.HandleFunc("/readyz", health)
+
 	return mux
 }

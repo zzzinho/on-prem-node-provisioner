@@ -67,6 +67,11 @@ type NodePoolTemplate struct {
 	Taints []corev1.Taint `json:"taints,omitempty"`
 }
 
+// ConsolidationPolicyWhenEmpty is the only Phase 1 disruption policy: a node may
+// be disrupted (drained and powered off) only once it is empty of evictable
+// workload. WhenUnderutilized is a Phase 2 enum extension, not a schema break.
+const ConsolidationPolicyWhenEmpty = "WhenEmpty"
+
 // DisruptionSpec configures scale-down policy. Consumed in M4.
 type DisruptionSpec struct {
 	// ConsolidationPolicy selects when a node may be disrupted. Phase 1 supports
@@ -76,7 +81,12 @@ type DisruptionSpec struct {
 	// +optional
 	ConsolidationPolicy string `json:"consolidationPolicy,omitempty"`
 
-	// ConsolidateAfter is how long a node must stay empty before it is drained.
+	// ConsolidateAfter is how long a node must stay continuously empty before ONP
+	// drains and powers it off. A nil pointer disables automatic scale-down for the
+	// pool even when consolidationPolicy is WhenEmpty: ONP will not power a node off
+	// without an explicit delay, so an operator never loses an idle node by leaving
+	// this unset (the "조용히 데이터를 잃는 기본값은 만들지 않는다" default). 0 means drain as
+	// soon as the node is observed empty.
 	// +optional
 	ConsolidateAfter *metav1.Duration `json:"consolidateAfter,omitempty"`
 }

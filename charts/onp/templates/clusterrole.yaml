@@ -1,7 +1,7 @@
 # Rules mirror config/rbac/role.yaml verbatim — the least privilege the
-# controller needs: watch Pods and Nodes, reconcile Machines/NodePools and their
-# status, emit Events. The wol-agent has NO ClusterRole/binding: it never touches
-# the k8s API.
+# controller needs: watch Pods and Nodes, cordon Nodes and evict Pods to drain,
+# reconcile Machines/NodePools and their status, emit Events. The wol-agent has
+# NO ClusterRole/binding: it never touches the k8s API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -21,11 +21,26 @@ rules:
   - ""
   resources:
   - nodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/eviction
+  verbs:
+  - create
 - apiGroups:
   - onp.io
   resources:

@@ -176,6 +176,14 @@ func (in *MachineStatus) DeepCopyInto(out *MachineStatus) {
 		in, out := &in.BootStartTime, &out.BootStartTime
 		*out = (*in).DeepCopy()
 	}
+	if in.DrainStartTime != nil {
+		in, out := &in.DrainStartTime, &out.DrainStartTime
+		*out = (*in).DeepCopy()
+	}
+	if in.EmptySince != nil {
+		in, out := &in.EmptySince, &out.EmptySince
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

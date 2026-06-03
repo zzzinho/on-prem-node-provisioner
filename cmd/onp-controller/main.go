@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
@@ -108,6 +109,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Index Pods by spec.nodeName so a drain can list a node's pods server-side
+	// instead of listing every pod in the cluster.
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, controller.IndexPodNodeName,
+		func(o client.Object) []string {
+			pod, ok := o.(*corev1.Pod)
+			if !ok || pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}); err != nil {
+		log.Error(err, "unable to set up pod field indexer")
+		os.Exit(1)
+	}
+
 	if err := (&controller.MachineReconciler{
 		Client:      mgr.GetClient(),
 		Scheme:      mgr.GetScheme(),
@@ -136,6 +151,16 @@ func main() {
 		Clock:    clock.RealClock{},
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up scale-up reconciler")
+		os.Exit(1)
+	}
+
+	if err := (&controller.ScaleDownReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("onp-controller"),
+		Clock:    clock.RealClock{},
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to set up scale-down reconciler")
 		os.Exit(1)
 	}
 
