@@ -126,13 +126,15 @@
 
 **Definition of Done**: 풀의 모든 노드를 꺼둔 상태에서 Pod 을 apply 하면, 적합한 Machine 이 **자동으로** 깨어나고 Pod 가 스케줄된다. 어노테이션 불필요.
 
-- [ ] `api/v1alpha1/nodepool_types.go` — 최소 필드 (`minNodes`, `maxNodes`, `machineSelector`, `template`, `cooldown.scaleUp`)
-- [ ] NodePool reconciler — pool 멤버십 갱신, `status.totalMachines`
-- [ ] Pod watcher — `PodScheduled=False, Reason=Unschedulable` 만 큐잉
-- [ ] Fit checker (`internal/scheduler/fit.go`) — 리소스 + nodeSelector + tolerations + required nodeAffinity. kube-scheduler framework 의존 X.
-- [ ] 후보 Machine 선정 로직: off 상태 + pool 멤버 + fit pass → best-fit (가장 작은 capacity 우선)
-- [ ] `maxNodes`, `cooldown.scaleUp` 적용
-- [ ] **검증 (E2E #1)**: 풀의 모든 노드 끄기 → `kubectl run pod ...` → 자동 wake + 스케줄 확인
+- [x] `api/v1alpha1/nodepool_types.go` — NodePool CRD 전체 스키마 (`minNodes`/`maxNodes`/`machineSelector`/`template`/`disruption`/`cooldown`/`drain` — M3 미사용 필드는 전방호환 자리, cluster-scoped `np`)
+- [x] NodePool reconciler — `machineSelector` 멤버십 → `status.totalMachines`/`readyMachines` 집계 (fake client 테스트 + 라이브 검증 `total=2 ready=1`)
+- [x] Pod watcher — `PodScheduled=False, Reason=Unschedulable` 만 큐잉 (predicate 필터)
+- [x] Fit checker (`internal/scheduler/fit.go`) — 리소스 + nodeSelector + tolerations + required nodeAffinity. kube-scheduler framework 의존 X (predicate 는 `k8s.io/component-helpers` 위임, 17개 단위 테스트)
+- [x] 후보 Machine 선정 로직: off 상태 + pool 멤버 + fit pass → best-fit (가장 작은 capacity 우선) + in-flight 가드(중복 wake 방지), 어노테이션 트리거로 M2.2 wake 경로 재사용
+- [x] `maxNodes`, `cooldown.scaleUp` 적용 (per-pool 가드, cooldown 은 `NodePool.status.lastScaleUpTime` 앵커 + 정확한 requeue, fake-clock 테스트)
+- [x] **검증 (E2E #1)**: 풀의 모든 노드 끄기 → `kubectl run pod ...` → 자동 wake + 스케줄 확인
+  - 실하드웨어에서 전 구간 통과(0.2.0 배포): unschedulable 파드 → scaleup 이 best-fit Machine 선정 → `wake-now` → PowerOn(WoL 매직 패킷) → 노드 부팅 → Node Ready → Machine Ready → kube-scheduler 가 파드를 해당 노드에 바인딩. **wake 송신부터 Ready+스케줄까지 ~40초.**
+  - 검증 노트: 타깃 노드가 ICMP 를 차단하므로 liveness 는 ICMP ping 이 아니라 **Node Ready / arping(L2)** 로 판정해야 함. 노드의 WoL 무장(`ethtool wol g`)은 비영속이라 재부팅 시 풀릴 수 있음 — 검증 전 무장 상태 확인 필요(ONP 외부 / 노드 운영자 책임).
 
 ---
 

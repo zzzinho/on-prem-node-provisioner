@@ -120,6 +120,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.NodePoolReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("onp-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to set up nodepool reconciler")
+		os.Exit(1)
+	}
+
+	if err := (&controller.ScaleUpReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("onp-controller"),
+		Clock:    clock.RealClock{},
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to set up scale-up reconciler")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
 		os.Exit(1)

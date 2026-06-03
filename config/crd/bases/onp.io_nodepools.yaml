@@ -1,0 +1,317 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: nodepools.onp.io
+spec:
+  group: onp.io
+  names:
+    kind: NodePool
+    listKind: NodePoolList
+    plural: nodepools
+    shortNames:
+    - np
+    singular: nodepool
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.minNodes
+      name: Min
+      type: integer
+    - jsonPath: .spec.maxNodes
+      name: Max
+      type: integer
+    - jsonPath: .status.totalMachines
+      name: Total
+      type: integer
+    - jsonPath: .status.readyMachines
+      name: Ready
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          NodePool is the pool-level policy that groups Machines by label and bounds
+          how ONP scales them. It is cluster-scoped, like Machine, so the two read
+          consistently with kubectl.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              NodePoolSpec is the desired state of a NodePool: the policy that groups a set
+              of Machines (by label) and bounds how ONP scales them.
+
+              M3.0 uses MinNodes (as a stored floor, not yet enforced) and MachineSelector
+              (to compute membership and status). The remaining fields are placeholders for
+              later milestones — they carry validation and defaults now so the schema does
+              not break when those milestones land (see CLAUDE.md "인터페이스 안정성").
+            properties:
+              cooldown:
+                description: |-
+                  Cooldown rate-limits scale decisions. Consumed in M3.3/M5; M3.0 only
+                  stores it.
+                properties:
+                  scaleDown:
+                    description: ScaleDown is the minimum interval between power-off
+                      decisions.
+                    type: string
+                  scaleUp:
+                    description: ScaleUp is the minimum interval between wake decisions.
+                    type: string
+                type: object
+              disruption:
+                description: |-
+                  Disruption configures when ONP scales the pool down. Consumed in M4;
+                  M3.0 only stores it.
+                properties:
+                  consolidateAfter:
+                    description: ConsolidateAfter is how long a node must stay empty
+                      before it is drained.
+                    type: string
+                  consolidationPolicy:
+                    description: |-
+                      ConsolidationPolicy selects when a node may be disrupted. Phase 1 supports
+                      WhenEmpty only. WhenUnderutilized is deliberately excluded from the enum
+                      until Phase 2 — adding it then is an enum extension, not a schema break.
+                    enum:
+                    - WhenEmpty
+                    type: string
+                type: object
+              drain:
+                description: |-
+                  Drain configures how nodes are drained before power-off. Consumed in M4;
+                  M3.0 only stores it.
+                properties:
+                  force:
+                    description: |-
+                      Force, when true, lets the drain evict do-not-disrupt / PDB-blocked Pods
+                      after the timeout. It defaults to false: deleting data without an explicit
+                      opt-in is exactly the "silently lose data" default ONP refuses to ship.
+                    type: boolean
+                  timeoutSeconds:
+                    description: |-
+                      TimeoutSeconds bounds how long a drain may run before it stops. A nil
+                      pointer means the controller default (300s).
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              machineSelector:
+                description: |-
+                  MachineSelector selects the Machines that belong to this pool by label.
+                  Label selection (rather than ownerReference) lets operators register
+                  Machines first and group them later with a one-line label edit; the cost
+                  is that a Machine can match two pools, which the controller surfaces as a
+                  conflict in later milestones. M3.0 uses this to compute membership.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              maxNodes:
+                description: |-
+                  MaxNodes caps how many nodes the pool may have powered on. A nil pointer
+                  means unbounded. Enforced in M3.3; M3.0 only stores it.
+                format: int32
+                minimum: 0
+                type: integer
+              minNodes:
+                default: 0
+                description: |-
+                  MinNodes is the floor of nodes ONP keeps powered on for this pool. M3.0
+                  only stores it; the floor is enforced in M5.
+                format: int32
+                minimum: 0
+                type: integer
+              template:
+                description: |-
+                  Template holds the labels and taints applied to a Node once its Machine
+                  becomes Ready. Consumed in M3.2+; M3.0 only stores it.
+                properties:
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: Labels are merged onto the backing Node.
+                    type: object
+                  taints:
+                    description: Taints are applied to the backing Node.
+                    items:
+                      description: |-
+                        The node this Taint is attached to has the "effect" on
+                        any pod that does not tolerate the Taint.
+                      properties:
+                        effect:
+                          description: |-
+                            Required. The effect of the taint on pods
+                            that do not tolerate the taint.
+                            Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: Required. The taint key to be applied to a
+                            node.
+                          type: string
+                        timeAdded:
+                          description: TimeAdded represents the time at which the
+                            taint was added.
+                          format: date-time
+                          type: string
+                        value:
+                          description: The taint value corresponding to the taint
+                            key.
+                          type: string
+                      required:
+                      - effect
+                      - key
+                      type: object
+                    type: array
+                type: object
+            required:
+            - machineSelector
+            type: object
+          status:
+            description: |-
+              NodePoolStatus is the observed state of a NodePool: the membership aggregate
+              ONP computes from the Machines matching spec.machineSelector.
+            properties:
+              conditions:
+                description: Conditions follow the standard Kubernetes condition pattern.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastScaleUpTime:
+                description: |-
+                  LastScaleUpTime is when ONP most recently woke a Machine in this pool; it
+                  anchors cooldown.scaleUp rate-limiting. Nil means no scale-up yet.
+                format: date-time
+                type: string
+              readyMachines:
+                description: |-
+                  ReadyMachines is the number of matching Machines whose status.state is
+                  Ready.
+                format: int32
+                type: integer
+              totalMachines:
+                description: TotalMachines is the number of Machines matching spec.machineSelector.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
