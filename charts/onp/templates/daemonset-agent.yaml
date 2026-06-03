@@ -51,6 +51,20 @@ spec:
           containerPort: {{ .Values.wolAgent.port }}
           hostPort: {{ .Values.wolAgent.port }}
           protocol: TCP
+        # /healthz and /readyz are served on the same listener as /wake; the agent
+        # is stateless, so "the server is up" is the whole health signal.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: wake
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: wake
+          initialDelaySeconds: 5
+          periodSeconds: 10
         # Broadcasting to 255.255.255.255 needs no Linux capability; the socket
         # SO_BROADCAST option is enough. So no privileged, no added caps.
         securityContext:
