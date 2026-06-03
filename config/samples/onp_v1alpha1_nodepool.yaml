@@ -1,0 +1,32 @@
+# Example NodePool — a policy over a group of physical Machines selected by label.
+# Values here are placeholders; copy and adapt to your cluster.
+apiVersion: onp.io/v1alpha1
+kind: NodePool
+metadata:
+  name: edge-pool
+spec:
+  # Floor of nodes kept powered on (enforced from M5). 0 = the pool may scale to
+  # zero when empty.
+  minNodes: 0
+  # Cap on powered-on nodes. Omit for unbounded.
+  maxNodes: 5
+  # Machines join this pool by matching these labels (Machine metadata.labels).
+  machineSelector:
+    matchLabels:
+      onp.io/pool: edge
+  # Labels/taints the pool's nodes are expected to carry; used in fit simulation.
+  template:
+    labels:
+      onp.io/pool: edge
+  # When ONP may power a node off. Phase 1 supports WhenEmpty only.
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+  # Rate-limit scale decisions.
+  cooldown:
+    scaleUp: 30s
+    scaleDown: 5m
+  # How nodes are drained before power-off.
+  drain:
+    timeoutSeconds: 300
+    force: false

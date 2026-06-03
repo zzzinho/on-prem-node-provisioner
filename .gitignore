@@ -5,6 +5,11 @@ testbin/
 *.out
 cover.out
 coverage.html
+# Compiled command binaries left in the repo root by `go build ./cmd/<x>`.
+/onp-controller
+/onp-wol-agent
+/onp-shutdown-agent
+/wol-probe
 
 # Go
 vendor/

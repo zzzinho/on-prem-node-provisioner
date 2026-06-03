@@ -1,0 +1,30 @@
+# Example Machine — one physical, already-joined node ONP powers on and off.
+# Values here are placeholders; copy and adapt (the MAC and nodeName are yours).
+apiVersion: onp.io/v1alpha1
+kind: Machine
+metadata:
+  name: worker-1
+  labels:
+    # Must match a NodePool.machineSelector to join that pool.
+    onp.io/pool: edge
+spec:
+  # The Node.name this Machine maps to (the node must already be joined).
+  nodeName: worker-1
+  # Resource capacity for fit checks while the node is OFF (kubelet's reported
+  # capacity is unavailable when powered down), so set it to the real values.
+  capacity:
+    cpu: "8"
+    memory: 32Gi
+  # Extra node labels used in fit simulation (e.g. to satisfy a pod nodeSelector).
+  labels:
+    kubernetes.io/hostname: worker-1
+  # Power-on mechanism. Phase 1 ships the wol provider.
+  power:
+    provider: wol
+    wol:
+      macAddress: "aa:bb:cc:dd:ee:ff"
+      # Subnet or limited broadcast the wake packet is sent to.
+      broadcastAddress: "255.255.255.255"
+  # Power-off mechanism. Phase 1 drains then powers off via the shutdown-agent.
+  shutdown:
+    provider: agent
