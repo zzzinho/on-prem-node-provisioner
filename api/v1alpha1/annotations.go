@@ -24,6 +24,15 @@ const (
 	// AnnotationDrainNowValue is the value AnnotationDrainNow must hold to
 	// trigger a drain. Any other value (or absence) is treated as "do not drain".
 	AnnotationDrainNowValue = "true"
+
+	// AnnotationCordonedByONP marks a Node that ONP cordoned itself during a
+	// drain, distinguishing it from a Node an operator cordoned by hand. ONP sets
+	// it together with spec.unschedulable when cordoning and removes it when
+	// uncordoning, so the wake path can uncordon only the nodes ONP cordoned and
+	// leave an operator's manual cordon untouched. Phase 1 nodes are long-lived
+	// and reused, so a scale-down cordon must be lifted when the node is woken
+	// back into service or a node woken for a pending pod stays unschedulable.
+	AnnotationCordonedByONP = "onp.io/cordoned-by-onp"
 )
 
 // Condition types ONP sets on Machine.status.conditions. They follow the

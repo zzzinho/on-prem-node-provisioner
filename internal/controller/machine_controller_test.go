@@ -231,6 +231,80 @@ func TestReconcileBootingNodeReadyBecomesReady(t *testing.T) {
 	}
 }
 
+func (f *reconcilerFixture) getNode(t *testing.T, name string) *corev1.Node {
+	t.Helper()
+	var n corev1.Node
+	if err := f.cl.Get(context.Background(), types.NamespacedName{Name: name}, &n); err != nil {
+		t.Fatalf("get node %q: %v", name, err)
+	}
+	return &n
+}
+
+// onpCordonedReadyNode is a Ready Node that ONP cordoned during a prior
+// scale-down: unschedulable and carrying the onp.io/cordoned-by-onp marker, as
+// such a node looks once it is powered back on.
+func onpCordonedReadyNode(name string) *corev1.Node {
+	n := readyNode(name)
+	n.Spec.Unschedulable = true
+	n.Annotations = map[string]string{v1alpha1.AnnotationCordonedByONP: "true"}
+	return n
+}
+
+// TestReconcileBootingUncordonsONPCordonedNode: a node ONP cordoned during a
+// prior scale-down is uncordoned (and the marker cleared) when it is woken back
+// to Ready, so it can host pods again.
+func TestReconcileBootingUncordonsONPCordonedNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"))
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateReady {
+		t.Fatalf("state = %q, want Ready", got.Status.State)
+	}
+	n := f.getNode(t, "node-a")
+	if n.Spec.Unschedulable {
+		t.Error("node still cordoned, want uncordoned on wake")
+	}
+	if _, ok := n.Annotations[v1alpha1.AnnotationCordonedByONP]; ok {
+		t.Error("cordoned-by-onp marker still present, want removed")
+	}
+}
+
+// TestReconcileBootingLeavesOperatorCordonAlone: a node an operator cordoned by
+// hand (no onp.io/cordoned-by-onp marker) stays cordoned when ONP wakes it — ONP
+// uncordons only its own cordons.
+func TestReconcileBootingLeavesOperatorCordonAlone(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	node := readyNode("node-a")
+	node.Spec.Unschedulable = true // operator-cordoned: no onp marker
+
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateReady {
+		t.Fatalf("state = %q, want Ready", got.Status.State)
+	}
+	if n := f.getNode(t, "node-a"); !n.Spec.Unschedulable {
+		t.Error("operator cordon was lifted, want left in place")
+	}
+}
+
 func TestReconcileBootingTimesOutFails(t *testing.T) {
 	t.Parallel()
 

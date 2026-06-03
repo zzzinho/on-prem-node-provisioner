@@ -63,6 +63,7 @@ const (
 	reasonDraining        = "Draining"
 	reasonDrainSucceeded  = "DrainSucceeded"
 	reasonDrainTimeout    = "DrainTimeout"
+	reasonUncordoned      = "Uncordoned"
 )
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
@@ -217,6 +218,13 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
 	if ready {
+		// A node ONP cordoned during a prior scale-down is being woken back into
+		// service; lift that cordon so it can host pods again. An operator's manual
+		// cordon (no onp.io/cordoned-by-onp marker) is left alone.
+		uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		m.Status.State = v1alpha1.MachineStateReady
 		m.Status.BootStartTime = nil
 		setCondition(m, v1alpha1.ConditionReady, metav1.ConditionTrue, reasonReady, "backing Node is Ready")
@@ -224,6 +232,10 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 			return ctrl.Result{}, fmt.Errorf("move machine %q to Ready: %w", m.Name, err)
 		}
 		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonReady, "Node %q is Ready", m.Spec.NodeName)
+		if uncordoned {
+			r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonUncordoned,
+				"uncordoned Node %q on wake (it was cordoned by a prior scale-down)", m.Spec.NodeName)
+		}
 		// Clear the trigger so a stale annotation does not re-wake the node later.
 		if err := r.removeWakeAnnotation(ctx, m); err != nil {
 			return ctrl.Result{}, err
@@ -457,9 +469,11 @@ func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (
 	return nil, nil
 }
 
-// setCordon patches the Node's spec.unschedulable to the given value, leaving it
-// untouched when already in the desired state. A missing Node is not an error:
-// the cordon target may have gone away, in which case there is nothing to drain.
+// setCordon patches the Node's spec.unschedulable to the given value and, in the
+// same patch, sets or clears the onp.io/cordoned-by-onp marker so a later wake
+// can tell ONP's cordon from an operator's. It is a no-op when the node already
+// matches both. A missing Node is not an error: the cordon target may have gone
+// away, in which case there is nothing to drain.
 func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) error {
 	if nodeName == "" {
 		return nil
@@ -471,15 +485,50 @@ func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unsc
 		}
 		return fmt.Errorf("get node %q to cordon: %w", nodeName, err)
 	}
-	if node.Spec.Unschedulable == unschedulable {
+	_, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]
+	// The marker tracks the cordon: present iff ONP holds the node cordoned.
+	if node.Spec.Unschedulable == unschedulable && marked == unschedulable {
 		return nil
 	}
 	patch := client.MergeFrom(node.DeepCopy())
 	node.Spec.Unschedulable = unschedulable
+	if unschedulable {
+		if node.Annotations == nil {
+			node.Annotations = map[string]string{}
+		}
+		node.Annotations[v1alpha1.AnnotationCordonedByONP] = "true"
+	} else {
+		delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
+	}
 	if err := r.Patch(ctx, &node, patch); err != nil {
 		return fmt.Errorf("set node %q unschedulable=%t: %w", nodeName, unschedulable, err)
 	}
 	return nil
+}
+
+// uncordonIfONPCordoned lifts a cordon ONP placed during a prior scale-down, so a
+// node brought back into service is schedulable again. It uncordons only nodes
+// carrying the onp.io/cordoned-by-onp marker, leaving an operator's manual cordon
+// untouched. It returns whether it uncordoned, so the caller can emit an Event. A
+// missing Node is not an error.
+func (r *MachineReconciler) uncordonIfONPCordoned(ctx context.Context, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, nil
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get node %q to uncordon: %w", nodeName, err)
+	}
+	if _, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]; !marked {
+		return false, nil
+	}
+	if err := r.setCordon(ctx, nodeName, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // evictablePods lists the pods scheduled on the node and returns the ones a
