@@ -151,7 +151,10 @@
 - [x] `drain.timeoutSeconds` (기본 300s, NodePool 해석) 초과 시 `state=Failed` + uncordon + Event (`force=false` 기본) — M4.1
 - [ ] PSA `privileged` 네임스페이스 격리 매니페스트
 - [x] Node NotReady 감지 시 `state=Off` 전이 — M4.0 (MachineReconciler `ShuttingDown→Off`, 실하드웨어 검증: agent `PoweringOff` → controller `PoweredOff`)
-- [ ] **검증 (E2E #2)**: 모든 Pod 삭제 → 일정 시간 후 빈 노드 자동 drain → 전원 OFF → `state=Off` 확인
+- [x] **검증 (E2E #2)** — 실하드웨어 통과 (2026-06-03, 차트 0.4.0 배포). 두 경로 모두 검증:
+  - **성공경로**: 빈 노드(desktop1) → `consolidateAfter` 60s 경과 → `ScaleDown` 이벤트("empty for 1m0s") → 자동 `drain-now` → `Draining`(빈 노드라 즉시) → `DrainSucceeded` → shutdown-agent `PoweringOff` → Node NotReady → `state=Off`. 재기상(실 WoL 부팅 ~54s)으로 복구.
+  - **안전경로**: PDB(`pg-primary`, ALLOWED DISRUPTIONS=0)로 보호된 CNPG `pg-1` 이 있는 노드에 drain → eviction 차단 → `drain.timeoutSeconds`(30s) 초과 → `DrainTimeout` Warning + **uncordon + `state=Failed`**. **pg-1 은 한 번도 안 내려감** — "조용히 데이터를 잃지 않는다" 기본값 실증.
+  - 검증 노트: desktop1 의 GPU 핀 워크로드(Knative LLM)는 KPA 가 재배치하므로 빈 노드를 만들려면 수동 cordon 필요. **발견한 갭**: scale-down 이 cordon 한 노드를 재기상해도 ONP 가 자동 uncordon 하지 않음 → scale-up 으로 깨운 노드가 unschedulable 로 남을 수 있음. wake→Ready 경로에서 uncordon 필요 (아래 M5 항목 참조).
 
 ---
 
@@ -163,6 +166,7 @@
 - [ ] `maxConcurrent` — 풀당 동시 Draining 노드 수 제한 (기본 1)
 - [ ] `onp.io/do-not-disrupt` 어노테이션 (Node/Pod 단위) 존중
 - [ ] `cooldown.scaleDown` 적용
+- [ ] **wake→Ready 시 자동 uncordon** (E2E #2 에서 발견) — scale-down 이 cordon 한 long-lived 노드를 다시 깨우면 cordon 이 남아 scale-up 으로 깨운 노드가 unschedulable 로 남는다. `Booting→Ready` 전이에서 ONP 가 직접 cordon 한 노드를 uncordon (운영자가 수동 cordon 한 경우와 구분 필요).
 - [ ] Leader election (`coordination.k8s.io/Lease`)
 - [ ] `/metrics` 노출:
   - [ ] `onp_nodes_total{pool, state}` (gauge)
