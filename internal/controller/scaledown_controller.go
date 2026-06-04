@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -70,6 +71,7 @@ type ScaleDownReconciler struct {
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -100,6 +102,17 @@ func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// manual annotation) means the node is on its way down; do not re-evaluate.
 	if drainRequested(&m) {
 		return ctrl.Result{}, nil
+	}
+
+	// A Node the operator marked do-not-disrupt is exempt from automatic scale-down
+	// entirely: never start its empty timer, and drop any anchor from before the
+	// annotation was added.
+	protected, err := r.nodeDoNotDisrupt(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if protected {
+		return ctrl.Result{}, r.clearEmptySince(ctx, &m)
 	}
 
 	pool, err := poolForMachine(ctx, r.Client, &m)
@@ -209,15 +222,34 @@ func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.
 	return ctrl.Result{}, nil
 }
 
-// nodeEmpty reports whether the node carries no evictable workload, by the same
-// definition the drain uses (DaemonSet, mirror, terminating and finished pods do
-// not count). A node with only those pods is empty.
+// nodeEmpty reports whether the node carries no workload, by the same definition
+// the drain uses for its empty check (DaemonSet, mirror, terminating and finished
+// pods do not count). A do-not-disrupt pod is workload, so a node carrying one is
+// never empty — which is how a Pod-level do-not-disrupt keeps its node out of
+// automatic scale-down without any special case here.
 func (r *ScaleDownReconciler) nodeEmpty(ctx context.Context, nodeName string) (bool, error) {
-	pods, err := evictablePodsOnNode(ctx, r.Client, nodeName)
+	pods, err := workloadPodsOnNode(ctx, r.Client, nodeName)
 	if err != nil {
 		return false, err
 	}
 	return len(pods) == 0, nil
+}
+
+// nodeDoNotDisrupt reports whether the backing Node carries the do-not-disrupt
+// annotation, which exempts the whole node from automatic scale-down. A missing
+// Node is not protected: there is nothing ONP could power off.
+func (r *ScaleDownReconciler) nodeDoNotDisrupt(ctx context.Context, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, nil
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get node %q for do-not-disrupt check: %w", nodeName, err)
+	}
+	return node.Annotations[v1alpha1.AnnotationDoNotDisrupt] == v1alpha1.AnnotationDoNotDisruptValue, nil
 }
 
 // stampEmptySince records the instant the node was first observed empty, the
@@ -408,7 +440,7 @@ func podEmptinessPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			pod, ok := e.Object.(*corev1.Pod)
-			return ok && pod.Spec.NodeName != "" && isEvictable(pod)
+			return ok && pod.Spec.NodeName != "" && isWorkload(pod)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			pod, ok := e.Object.(*corev1.Pod)
@@ -420,7 +452,7 @@ func podEmptinessPredicate() predicate.Predicate {
 			if !ok1 || !ok2 || newPod.Spec.NodeName == "" {
 				return false
 			}
-			return isEvictable(oldPod) != isEvictable(newPod)
+			return isWorkload(oldPod) != isWorkload(newPod)
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}

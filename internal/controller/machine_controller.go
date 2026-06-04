@@ -370,7 +370,7 @@ func (r *MachineReconciler) reconcileReadyNodeLost(ctx context.Context, m *v1alp
 // cordoned across Draining -> ShuttingDown -> Off; only the timeout path
 // uncordons.
 func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
-	timeout, err := r.drainTimeout(ctx, m)
+	timeout, force, err := r.drainPolicy(ctx, m)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -396,12 +396,17 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 		return ctrl.Result{}, err
 	}
 
-	pods, err := r.evictablePods(ctx, m.Spec.NodeName)
+	// The node is empty for power-off once no workload pods remain — including any
+	// do-not-disrupt pods, which an unforced drain will not evict. So a node
+	// carrying only a do-not-disrupt pod never reads empty here; the drain stalls
+	// below until the timeout above fails it, rather than powering the node off
+	// with the protected pod still on it.
+	workload, err := r.workloadPods(ctx, m.Spec.NodeName)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("list evictable pods on node %q: %w", m.Spec.NodeName, err)
+		return ctrl.Result{}, fmt.Errorf("list workload pods on node %q: %w", m.Spec.NodeName, err)
 	}
 
-	if len(pods) == 0 {
+	if len(workload) == 0 {
 		// Node is empty: hand off to the power-off leg. Leave it cordoned — it is
 		// on its way down, and reconcileShuttingDown + the agent finish it. Anchor
 		// the shutdown timeout from here so a power-off that never lands fails
@@ -419,17 +424,23 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 		return ctrl.Result{}, nil
 	}
 
-	for i := range pods {
-		if err := r.evictPod(ctx, &pods[i]); err != nil {
+	// Evict only the drainable pods. do-not-disrupt pods are skipped (unless force),
+	// so they keep the node non-empty and the drain runs out the clock into Failed
+	// instead of disrupting them.
+	for i := range workload {
+		if !isDrainable(&workload[i], force) {
+			continue
+		}
+		if err := r.evictPod(ctx, &workload[i]); err != nil {
 			if apierrors.IsTooManyRequests(err) {
 				// PDB blocked this eviction. Expected, not an error: keep draining
 				// and re-check after the poll interval; the timeout above is the
 				// backstop if the disruption budget never opens.
 				log.FromContext(ctx).V(1).Info("eviction blocked by disruption budget",
-					"pod", pods[i].Name, "node", m.Spec.NodeName)
+					"pod", workload[i].Name, "node", m.Spec.NodeName)
 				continue
 			}
-			return ctrl.Result{}, fmt.Errorf("evict pod %q on node %q: %w", pods[i].Name, m.Spec.NodeName, err)
+			return ctrl.Result{}, fmt.Errorf("evict pod %q on node %q: %w", workload[i].Name, m.Spec.NodeName, err)
 		}
 	}
 
@@ -533,19 +544,23 @@ func (r *MachineReconciler) shutdownTimedOut(m *v1alpha1.Machine) bool {
 	return r.Clock.Since(m.Status.ShutdownStartTime.Time) > r.ShutdownTimeout
 }
 
-// drainTimeout resolves the drain budget for a Machine from its NodePool's
-// drain.timeoutSeconds, falling back to defaultDrainTimeout when the pool sets
-// no timeout or no pool matches. The first matching pool wins; pool overlap is a
-// conflict surfaced elsewhere, not resolved here.
-func (r *MachineReconciler) drainTimeout(ctx context.Context, m *v1alpha1.Machine) (time.Duration, error) {
+// drainPolicy resolves the drain budget and force flag for a Machine from its
+// NodePool's drain spec in a single pool lookup: drain.timeoutSeconds (falling
+// back to defaultDrainTimeout) and drain.force (default false). The first matching
+// pool wins; pool overlap is a conflict surfaced elsewhere, not resolved here.
+func (r *MachineReconciler) drainPolicy(ctx context.Context, m *v1alpha1.Machine) (timeout time.Duration, force bool, err error) {
 	pool, err := poolForMachine(ctx, r.Client, m)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	if pool == nil || pool.Spec.Drain.TimeoutSeconds == nil {
-		return defaultDrainTimeout, nil
+	timeout = defaultDrainTimeout
+	if pool != nil {
+		if pool.Spec.Drain.TimeoutSeconds != nil {
+			timeout = time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second
+		}
+		force = pool.Spec.Drain.Force
 	}
-	return time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second, nil
+	return timeout, force, nil
 }
 
 // poolForMachine returns the first NodePool whose machineSelector matches the
@@ -634,21 +649,19 @@ func (r *MachineReconciler) uncordonIfONPCordoned(ctx context.Context, nodeName 
 	return true, nil
 }
 
-// evictablePods lists the pods scheduled on the node and returns the ones a
-// drain must evict. See evictablePodsOnNode for the exclusion rules.
-func (r *MachineReconciler) evictablePods(ctx context.Context, nodeName string) ([]corev1.Pod, error) {
-	return evictablePodsOnNode(ctx, r.Client, nodeName)
+// workloadPods lists the pods scheduled on the node that keep it non-empty. See
+// workloadPodsOnNode for the exclusion rules.
+func (r *MachineReconciler) workloadPods(ctx context.Context, nodeName string) ([]corev1.Pod, error) {
+	return workloadPodsOnNode(ctx, r.Client, nodeName)
 }
 
-// evictablePodsOnNode lists the pods scheduled on the node and returns the ones a
-// drain must evict — equivalently, the pods that make the node non-empty. It
-// excludes pods that eviction cannot or should not move: DaemonSet-owned pods
-// (rescheduled to the node regardless), mirror/static pods (not API-managed),
-// already-terminating pods, and finished pods. The drain loop (what to evict) and
-// the scale-down path (is the node empty) both read it, so a node is detected
-// "empty" by exactly the condition the drain later confirms. nodeName "" yields
-// no pods.
-func evictablePodsOnNode(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
+// workloadPodsOnNode lists the pods scheduled on the node and returns the ones that
+// make it non-empty (see isWorkload for the exclusion rules). The drain loop reads
+// it to decide when the node is empty enough to power off, and the scale-down path
+// reads it to decide whether the node is idle — so a node is detected "empty" by
+// exactly the condition the drain later confirms. What an unforced drain may
+// actually evict is the narrower isDrainable subset. nodeName "" yields no pods.
+func workloadPodsOnNode(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
 	if nodeName == "" {
 		return nil, nil
 	}
@@ -656,13 +669,13 @@ func evictablePodsOnNode(ctx context.Context, c client.Client, nodeName string) 
 	if err := c.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
 		return nil, err
 	}
-	evictable := make([]corev1.Pod, 0, len(pods.Items))
+	workload := make([]corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
-		if isEvictable(&pods.Items[i]) {
-			evictable = append(evictable, pods.Items[i])
+		if isWorkload(&pods.Items[i]) {
+			workload = append(workload, pods.Items[i])
 		}
 	}
-	return evictable, nil
+	return workload, nil
 }
 
 // evictPod issues one eviction through the injected Evict func, or the
@@ -688,9 +701,18 @@ func evictViaSubResource(ctx context.Context, c client.Client, pod *corev1.Pod) 
 	return c.SubResource("eviction").Create(ctx, pod, eviction)
 }
 
-// isEvictable reports whether a drain should evict the pod. The exclusions match
-// kubectl drain's defaults for an unforced drain.
-func isEvictable(pod *corev1.Pod) bool {
+// isWorkload reports whether the pod keeps its node non-empty: a drain must clear
+// it before the node can power off, and the scale-down path counts it as occupying
+// the node. The exclusions match kubectl drain's defaults: DaemonSet-owned pods
+// (rescheduled to the node regardless), mirror/static pods (not API-managed),
+// already-terminating pods, and finished pods.
+//
+// A do-not-disrupt pod is still workload — it keeps the node non-empty, so
+// scale-down never targets its node and a drain never reports the node empty while
+// it runs. Whether a drain may *evict* it is a separate decision, made by
+// isDrainable: emptiness (this function) and evictability (isDrainable) diverge
+// precisely on do-not-disrupt, which is why they are two predicates, not one.
+func isWorkload(pod *corev1.Pod) bool {
 	if pod.DeletionTimestamp != nil {
 		return false
 	}
@@ -705,8 +727,28 @@ func isEvictable(pod *corev1.Pod) bool {
 			return false
 		}
 	}
-	// TODO(M5): honor the onp.io/do-not-disrupt annotation here as a hard guard.
 	return true
+}
+
+// isDrainable reports whether a drain should evict the pod. It is the workload set
+// minus do-not-disrupt pods, which an unforced drain must not evict — so a node
+// carrying only a do-not-disrupt pod never empties and the drain times out into
+// Failed rather than disrupting the pod. force lifts the exemption: an operator who
+// sets drain.force has explicitly opted into evicting protected pods.
+func isDrainable(pod *corev1.Pod, force bool) bool {
+	if !isWorkload(pod) {
+		return false
+	}
+	if force {
+		return true
+	}
+	return !hasDoNotDisrupt(pod)
+}
+
+// hasDoNotDisrupt reports whether the pod carries the do-not-disrupt annotation set
+// to its trigger value.
+func hasDoNotDisrupt(pod *corev1.Pod) bool {
+	return pod.Annotations[v1alpha1.AnnotationDoNotDisrupt] == v1alpha1.AnnotationDoNotDisruptValue
 }
 
 // requeueForBoot returns how long to wait before re-reconciling a Booting
