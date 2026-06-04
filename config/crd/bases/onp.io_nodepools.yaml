@@ -102,6 +102,18 @@ spec:
                     enum:
                     - WhenEmpty
                     type: string
+                  maxConcurrent:
+                    default: 1
+                    description: |-
+                      MaxConcurrent caps how many of the pool's nodes ONP may have draining (or
+                      already powering off) at once, so a wave of idle nodes is retired one or a
+                      few at a time rather than all together. It defaults to 1: serial scale-down
+                      is the least surprising, safest behavior, and an operator opts into more
+                      disruption explicitly. A nil pointer is read as 1 by the controller so
+                      objects created before this field existed keep that safe default.
+                    format: int32
+                    minimum: 1
+                    type: integer
                 type: object
               drain:
                 description: |-
@@ -298,6 +310,13 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastScaleDownTime:
+                description: |-
+                  LastScaleDownTime is when ONP most recently triggered a drain/power-off of a
+                  Machine in this pool; it anchors cooldown.scaleDown rate-limiting, mirroring
+                  LastScaleUpTime. Nil means no scale-down yet.
+                format: date-time
+                type: string
               lastScaleUpTime:
                 description: |-
                   LastScaleUpTime is when ONP most recently woke a Machine in this pool; it
