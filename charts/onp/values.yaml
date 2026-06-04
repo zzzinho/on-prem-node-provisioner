@@ -15,8 +15,15 @@ controller:
   replicas: 1
   # How long to wait for a woken node to report Ready before failing.
   bootTimeout: 10m
+  # How long to wait for a node to go NotReady after power-off before failing the
+  # Machine (so a power-off that never lands does not poll forever).
+  shutdownTimeout: 5m
+  # How long a Ready Machine's Node may stay NotReady (with no ONP drain) before
+  # the Machine falls back to Off so scale-up can wake it again.
+  nodeLossGracePeriod: 1m
   logLevel: info
-  # Single-replica by default; flip on when running >1 replica.
+  # Single-replica by default. For HA set replicas > 1 AND leaderElect: true; the
+  # lease RBAC (Role/RoleBinding) is rendered only when leaderElect is true.
   leaderElect: false
   resources:
     requests:
@@ -69,3 +76,20 @@ placement:
     onp.io/always-on: "true"
   tolerations:
     - operator: Exists
+
+# The release namespace must permit the privileged shutdown-agent DaemonSet. On a
+# cluster that enforces Pod Security Admission, the namespace needs the
+# `pod-security.kubernetes.io/enforce: privileged` label.
+#
+# If you install with `helm install --create-namespace`, Helm does not label the
+# namespace; set `kubectl label ns <ns> pod-security.kubernetes.io/enforce=privileged`
+# yourself, or let the chart own the namespace by setting create: true here and
+# installing WITHOUT --create-namespace.
+namespace:
+  # When true, the chart creates the release namespace and stamps the PSA label
+  # below on it. Leave false (the default) when you manage the namespace yourself
+  # or use --create-namespace.
+  create: false
+  # Pod Security Standard enforced on the namespace when create is true. Must be
+  # privileged for the shutdown-agent to schedule.
+  podSecurityEnforce: privileged

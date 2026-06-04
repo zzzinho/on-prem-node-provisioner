@@ -42,6 +42,8 @@ spec:
         args:
         - --wol-agent-endpoint=http://{{ include "onp.fullname" . }}-wol-agent.{{ .Release.Namespace }}.svc:{{ .Values.wolAgent.port }}
         - --boot-timeout={{ .Values.controller.bootTimeout }}
+        - --shutdown-timeout={{ .Values.controller.shutdownTimeout }}
+        - --node-loss-grace-period={{ .Values.controller.nodeLossGracePeriod }}
         - --log-level={{ .Values.controller.logLevel }}
         - --leader-elect={{ .Values.controller.leaderElect }}
         - --health-probe-bind-address=:8081

@@ -1,0 +1,14 @@
+{{- if .Values.namespace.create }}
+# Optional: let the chart own the release namespace so it can carry the Pod
+# Security Admission label the privileged shutdown-agent needs. Enable with
+# namespace.create=true and install WITHOUT --create-namespace (Helm cannot label
+# a namespace it does not manage). On clusters that do not enforce PSA this is
+# unnecessary — label or create the namespace however you prefer.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.namespace.podSecurityEnforce | quote }}
+{{- end }}

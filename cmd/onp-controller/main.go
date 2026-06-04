@@ -85,6 +85,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "onp-controller.onp.io",
+		// Release the lease on graceful shutdown so a rolling update's next replica
+		// becomes leader at once instead of waiting out the lease duration.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		log.Error(err, "unable to create manager")
