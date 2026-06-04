@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -67,6 +68,11 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Status().Update(ctx, &pool); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for nodepool %q: %w", pool.Name, err)
 	}
+	// Surface the membership change as an Event so an operator can follow a pool's
+	// size over time with kubectl describe. It fires only on an actual count change
+	// (the early return above skips the no-op case), so it does not storm.
+	r.Recorder.Eventf(&pool, corev1.EventTypeNormal, "Membership",
+		"pool membership: %d machines, %d ready", total, ready)
 	return ctrl.Result{}, nil
 }
 
