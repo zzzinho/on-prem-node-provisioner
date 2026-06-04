@@ -64,6 +64,8 @@ const (
 	reasonDrainSucceeded  = "DrainSucceeded"
 	reasonDrainTimeout    = "DrainTimeout"
 	reasonUncordoned      = "Uncordoned"
+	reasonShutdownTimeout = "ShutdownTimeout"
+	reasonNodeLost        = "NodeLost"
 )
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
@@ -93,7 +95,19 @@ type MachineReconciler struct {
 	Registry *power.Registry
 	// BootTimeout is how long a Machine may stay Booting before it is failed.
 	BootTimeout time.Duration
-	Recorder    record.EventRecorder
+	// ShutdownTimeout is how long a Machine may stay ShuttingDown — waiting for its
+	// backing Node to go NotReady — before it is failed. It bounds the only state
+	// that otherwise polls indefinitely: if the power-off never lands (the agent
+	// did not run, or the board powered itself back on), the Machine fails instead
+	// of polling forever.
+	ShutdownTimeout time.Duration
+	// NodeLossGracePeriod is how long a Ready Machine's backing Node may stay
+	// NotReady — without ONP having started a drain — before the Machine falls back
+	// to Off. The grace window absorbs brief kubelet blips so a transient NotReady
+	// does not flap the Machine; a sustained loss (an external power-off) drops it
+	// to Off, whence scale-up can wake it again.
+	NodeLossGracePeriod time.Duration
+	Recorder            record.EventRecorder
 	// Clock reads the current time for boot-timeout math; injected so tests can
 	// drive it with a fake clock. A PassiveClock is enough — the timeout is
 	// evaluated each reconcile, not scheduled.
@@ -258,21 +272,49 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 	return ctrl.Result{RequeueAfter: r.requeueForBoot(m)}, nil
 }
 
-// reconcileReady tidies a leftover wake-now annotation and starts a drain when
-// the drain-now annotation is set. A drain-now on a non-Ready Machine is ignored
-// — only Ready -> Draining — so the trigger cannot interrupt a boot or a
-// power-off that is already in flight.
+// reconcileReady tidies a leftover wake-now annotation, starts a drain when the
+// drain-now annotation is set, and otherwise watches for external node loss. A
+// drain-now on a non-Ready Machine is ignored — only Ready -> Draining — so the
+// trigger cannot interrupt a boot or a power-off already in flight.
 func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	// Tidy a leftover one-shot wake trigger first, so a stale "true" cannot re-wake
+	// the node after it later powers off (e.g. once a drain below takes it down).
 	if _, ok := m.Annotations[v1alpha1.AnnotationWakeNow]; ok {
 		if err := r.removeWakeAnnotation(ctx, m); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	if !drainRequested(m) {
-		return ctrl.Result{}, nil
+	// drain-now is ONP's own scale-down. A node going NotReady under a pending
+	// drain is expected, so the external-loss check below is skipped when a drain
+	// is requested.
+	if drainRequested(m) {
+		return r.startDraining(ctx, m)
 	}
 
+	// No drain pending: a Ready Machine whose backing Node has gone NotReady was
+	// lost outside ONP (powered off by hand, crashed, partitioned). Fall back to
+	// Off after a grace window so scale-up can wake it again.
+	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
+	}
+	if !ready {
+		return r.reconcileReadyNodeLost(ctx, m)
+	}
+	if m.Status.NotReadySince != nil {
+		// The Node recovered within the grace window; drop the stale loss anchor.
+		if err := r.clearNotReadySince(ctx, m); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+// startDraining moves a Ready Machine into Draining in response to drain-now and
+// clears the one-shot trigger. The cordon -> evict -> power-off path runs from
+// reconcileDraining.
+func (r *MachineReconciler) startDraining(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
 	now := metav1.NewTime(r.Clock.Now())
 	m.Status.State = v1alpha1.MachineStateDraining
 	m.Status.DrainStartTime = &now
@@ -287,6 +329,38 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{Requeue: true}, nil
+}
+
+// reconcileReadyNodeLost handles a Ready Machine whose backing Node has gone
+// NotReady outside any ONP-initiated drain. It anchors NotReadySince on first
+// observation and requeues; once the Node has stayed NotReady for the whole grace
+// window it drops the Machine to Off, whence scale-up can wake it again. The
+// window absorbs brief kubelet blips so a transient NotReady does not flap state.
+func (r *MachineReconciler) reconcileReadyNodeLost(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	if m.Status.NotReadySince == nil {
+		if err := r.stampNotReadySince(ctx, m); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: r.NodeLossGracePeriod}, nil
+	}
+	if elapsed := r.Clock.Since(m.Status.NotReadySince.Time); elapsed < r.NodeLossGracePeriod {
+		wait := r.NodeLossGracePeriod - elapsed
+		if wait < time.Second {
+			wait = time.Second
+		}
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+
+	m.Status.State = v1alpha1.MachineStateOff
+	m.Status.NotReadySince = nil
+	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonNodeLost,
+		fmt.Sprintf("Node %q stayed NotReady for %s without an ONP drain; assuming powered off", m.Spec.NodeName, r.NodeLossGracePeriod))
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("move machine %q to Off after node loss: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonNodeLost,
+		"Node %q lost (NotReady for %s) with no ONP drain; Machine is Off", m.Spec.NodeName, r.NodeLossGracePeriod)
+	return ctrl.Result{}, nil
 }
 
 // reconcileDraining cordons the backing Node and evicts its workload, then moves
@@ -329,8 +403,12 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 
 	if len(pods) == 0 {
 		// Node is empty: hand off to the power-off leg. Leave it cordoned — it is
-		// on its way down, and reconcileShuttingDown + the agent finish it.
+		// on its way down, and reconcileShuttingDown + the agent finish it. Anchor
+		// the shutdown timeout from here so a power-off that never lands fails
+		// rather than polling forever.
+		now := metav1.NewTime(r.Clock.Now())
 		m.Status.State = v1alpha1.MachineStateShuttingDown
+		m.Status.ShutdownStartTime = &now
 		setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionTrue, reasonDrainSucceeded,
 			fmt.Sprintf("Node %q drained; powering off", m.Spec.NodeName))
 		if err := r.Status().Update(ctx, m); err != nil {
@@ -371,14 +449,29 @@ func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alph
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
 	if ready {
-		// Poweroff not observed yet. Requeue to keep polling; the Node watch will
-		// also enqueue us on the NotReady transition, this is the safety net.
-		// TODO(M4.1/M5): add a shutdown timeout that moves a stuck ShuttingDown
-		// Machine to Failed rather than polling forever.
-		return ctrl.Result{RequeueAfter: shutdownPollInterval}, nil
+		// Poweroff not observed yet. If the node has not gone down within the
+		// shutdown budget the power-off did not land (the agent never ran, or the
+		// board powered itself back on) — fail rather than poll forever. The node is
+		// left cordoned for the operator to inspect.
+		if r.shutdownTimedOut(m) {
+			m.Status.State = v1alpha1.MachineStateFailed
+			m.Status.ShutdownStartTime = nil
+			setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonShutdownTimeout,
+				fmt.Sprintf("Node %q still Ready %s after power-off was issued", m.Spec.NodeName, r.ShutdownTimeout))
+			if err := r.Status().Update(ctx, m); err != nil {
+				return ctrl.Result{}, fmt.Errorf("fail machine %q on shutdown timeout: %w", m.Name, err)
+			}
+			r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonShutdownTimeout,
+				"Node %q did not power off within %s; marked Failed", m.Spec.NodeName, r.ShutdownTimeout)
+			return ctrl.Result{}, nil
+		}
+		// Requeue to keep polling; the Node watch will also enqueue us on the
+		// NotReady transition, this is the safety net.
+		return ctrl.Result{RequeueAfter: r.requeueForShutdown(m)}, nil
 	}
 
 	m.Status.State = v1alpha1.MachineStateOff
+	m.Status.ShutdownStartTime = nil
 	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonPoweredOff,
 		fmt.Sprintf("Node %q is no longer Ready; power-off complete", m.Spec.NodeName))
 	if err := r.Status().Update(ctx, m); err != nil {
@@ -428,6 +521,16 @@ func (r *MachineReconciler) drainTimedOut(m *v1alpha1.Machine, timeout time.Dura
 		return false
 	}
 	return r.Clock.Since(m.Status.DrainStartTime.Time) > timeout
+}
+
+// shutdownTimedOut reports whether the Machine has been ShuttingDown longer than
+// ShutdownTimeout. A missing ShutdownStartTime is treated as not-yet-timed-out,
+// by the same half-written-status reasoning as bootTimedOut/drainTimedOut.
+func (r *MachineReconciler) shutdownTimedOut(m *v1alpha1.Machine) bool {
+	if m.Status.ShutdownStartTime == nil {
+		return false
+	}
+	return r.Clock.Since(m.Status.ShutdownStartTime.Time) > r.ShutdownTimeout
 }
 
 // drainTimeout resolves the drain budget for a Machine from its NodePool's
@@ -623,6 +726,24 @@ func (r *MachineReconciler) requeueForBoot(m *v1alpha1.Machine) time.Duration {
 	return bootPollInterval
 }
 
+// requeueForShutdown returns how long to wait before re-reconciling a
+// ShuttingDown Machine: the smaller of the poll interval and the remaining
+// shutdown budget, so we wake up close to the deadline even when polling slower.
+// It mirrors requeueForBoot.
+func (r *MachineReconciler) requeueForShutdown(m *v1alpha1.Machine) time.Duration {
+	if m.Status.ShutdownStartTime == nil {
+		return shutdownPollInterval
+	}
+	remaining := r.ShutdownTimeout - r.Clock.Since(m.Status.ShutdownStartTime.Time)
+	if remaining < shutdownPollInterval {
+		if remaining < 0 {
+			remaining = 0
+		}
+		return remaining
+	}
+	return shutdownPollInterval
+}
+
 // removeWakeAnnotation strips the one-shot wake trigger via a patch so the
 // removal does not clobber concurrent spec edits.
 func (r *MachineReconciler) removeWakeAnnotation(ctx context.Context, m *v1alpha1.Machine) error {
@@ -661,6 +782,36 @@ func (r *MachineReconciler) removeDrainAnnotation(ctx context.Context, m *v1alph
 // value.
 func drainRequested(m *v1alpha1.Machine) bool {
 	return m.Annotations[v1alpha1.AnnotationDrainNow] == v1alpha1.AnnotationDrainNowValue
+}
+
+// stampNotReadySince records the instant a Ready Machine's Node was first seen
+// NotReady, the anchor for the node-loss grace window. It uses a MergeFrom status
+// patch so it sends only that one field and does not clobber concurrent status
+// writes (the scale-down path patches emptySince on the same object).
+func (r *MachineReconciler) stampNotReadySince(ctx context.Context, m *v1alpha1.Machine) error {
+	orig := m.DeepCopy()
+	now := metav1.NewTime(r.Clock.Now())
+	m.Status.NotReadySince = &now
+	if err := r.Status().Patch(ctx, m, client.MergeFrom(orig)); err != nil {
+		return fmt.Errorf("stamp notReadySince on machine %q: %w", m.Name, err)
+	}
+	return nil
+}
+
+// clearNotReadySince drops the node-loss anchor when the Node is Ready again. It
+// is a no-op when the anchor is already unset. The patch nils the field via a JSON
+// merge patch (omitempty -> the diff sends notReadySince: null), mirroring the
+// scale-down path's clearEmptySince.
+func (r *MachineReconciler) clearNotReadySince(ctx context.Context, m *v1alpha1.Machine) error {
+	if m.Status.NotReadySince == nil {
+		return nil
+	}
+	orig := m.DeepCopy()
+	m.Status.NotReadySince = nil
+	if err := r.Status().Patch(ctx, m, client.MergeFrom(orig)); err != nil {
+		return fmt.Errorf("clear notReadySince on machine %q: %w", m.Name, err)
+	}
+	return nil
 }
 
 // setCondition writes a standard condition, stamping LastTransitionTime only on
