@@ -162,23 +162,33 @@
 
 **Definition of Done**: `helm install onp ./charts/onp` 한 번으로 클린 클러스터에서 전체 동작. 운영 안전장치(minNodes, cooldown, do-not-disrupt, maxConcurrent) 모두 작동. `/metrics` 로 핵심 메트릭 노출. README 만으로 다른 사람이 설치 가능.
 
-- [ ] `minNodes` 하한 보장 — 풀이 minNodes 아래로 내려가는 스케일 다운 거절
-- [ ] `maxConcurrent` — 풀당 동시 Draining 노드 수 제한 (기본 1)
-- [ ] `onp.io/do-not-disrupt` 어노테이션 (Node/Pod 단위) 존중
-- [ ] `cooldown.scaleDown` 적용
-- [ ] **wake→Ready 시 자동 uncordon** (E2E #2 에서 발견) — scale-down 이 cordon 한 long-lived 노드를 다시 깨우면 cordon 이 남아 scale-up 으로 깨운 노드가 unschedulable 로 남는다. `Booting→Ready` 전이에서 ONP 가 직접 cordon 한 노드를 uncordon (운영자가 수동 cordon 한 경우와 구분 필요).
-- [ ] Leader election (`coordination.k8s.io/Lease`)
-- [ ] `/metrics` 노출:
-  - [ ] `onp_nodes_total{pool, state}` (gauge)
-  - [ ] `onp_scale_up_latency_seconds` (histogram)
-  - [ ] `onp_power_on_total{provider, result}` (counter)
-  - [ ] `onp_drain_failure_total{reason}` (counter)
-  - [ ] `onp_pending_unschedulable` (gauge)
-- [ ] Kubernetes Events 발행 (Machine / NodePool / 관련 Pod)
-- [ ] Status Conditions 표준화 (`PowerOnSucceeded`, `DrainSucceeded`, `Ready`)
-- [ ] `charts/onp/` Helm 차트 마무리 — M2~M4 에서 누적된 차트(controller + wol-agent + shutdown-agent + CRD + RBAC)에 PSA·values 정리·packaging·버전 태깅 추가
-- [ ] README: 설치 가이드, 샘플 `NodePool` / `Machine` YAML, 트러블슈팅
-- [ ] **검증**: 빈 클러스터에 `helm install` → E2E #1 / #2 시나리오 통과
+**기반 결정 / 리뷰 반영** (M5 착수 시 확정):
+
+- M4 직후 전체 코드 리뷰 → destructive path 는 안전(Eviction/PDB/force-off/노드 신원 이중방어)하나 운영 안전장치 미구현 확인. minNodes 하한이 1순위 갭.
+- 스키마 4필드 추가 (모두 additive): `disruption.maxConcurrent`(기본 1), `status.lastScaleDownTime`, Machine `status.shutdownStartTime`/`notReadySince`.
+- 리뷰에서 나온 상태머신 갭 2개 포함: **A1** shutdown 타임아웃→`Failed`, **A2** 외부 노드 손실 시 grace 후 `Ready→Off`.
+- emptiness ↔ evictability 분리 (`isWorkload` vs `isDrainable`) — do-not-disrupt 를 단일 술어에 넣는 함정 회피.
+- Leader election 은 wiring + lease RBAC 만, 차트 기본은 1 replica / off (전원 컨트롤러는 단일 결정자가 안전).
+
+- [x] `minNodes` 하한 보장 — 풀이 minNodes 아래로 내려가는 스케일 다운 거절 (`ScaleDownReconciler.triggerScaleDown`, keptOn 카운트는 in-flight drain 제외)
+- [x] `maxConcurrent` — 풀당 동시 Draining 노드 수 제한 (기본 1, `disruption.maxConcurrent` nil→1)
+- [x] `onp.io/do-not-disrupt` 어노테이션 (Node/Pod 단위) 존중 — Node=scale-down 제외, Pod=노드 non-empty 취급 + 수동 drain hard-guard (force 아니면 evict 안 함→timeout→Failed)
+- [x] `cooldown.scaleDown` 적용 (`status.lastScaleDownTime` 앵커, `stampScaleDown`/`coolingDownUntil` = scaleUp 대칭)
+- [x] **wake→Ready 시 자동 uncordon** (E2E #2 에서 발견) — `Booting→Ready` 에서 `onp.io/cordoned-by-onp` 마커가 붙은 ONP 자신의 cordon 만 해제 (운영자 수동 cordon 과 구분). M4 단계에서 선반영됨.
+- [x] **A1 — shutdown 타임아웃** (리뷰): `ShuttingDown` 에서 Node 가 `--shutdown-timeout`(기본 5m) 내 NotReady 안 되면 `Failed` (무한 폴링 제거).
+- [x] **A2 — 외부 노드 손실** (리뷰): `Ready` Machine 의 Node 가 ONP drain 없이 NotReady → `--node-loss-grace-period`(기본 1m) 후 `Off` (scale-up 이 자연 복구; blip 흡수).
+- [x] Leader election (`coordination.k8s.io/Lease`) — wiring + `LeaderElectionReleaseOnCancel` + 조건부 lease RBAC. 차트 기본 1 replica/off.
+- [x] `/metrics` 노출 (`onp_` 5종, controller-runtime 레지스트리):
+  - [x] `onp_nodes_total{pool, state}` (gauge) — scrape-time Collector
+  - [x] `onp_scale_up_latency_seconds` (histogram) — BootStartTime→Ready
+  - [x] `onp_power_on_total{provider, result}` (counter)
+  - [x] `onp_drain_failure_total{reason}` (counter) — drain_timeout / shutdown_timeout
+  - [x] `onp_pending_unschedulable` (gauge) — scrape-time Collector
+- [x] Kubernetes Events 발행 (Machine / NodePool / 관련 Pod) — NodePool `Membership` 이벤트 추가, Machine/Pod 는 기존
+- [x] Status Conditions 표준화 (`PowerOnSucceeded`, `DrainSucceeded`, `Ready`) — `setCondition` 표준 패턴
+- [x] `charts/onp/` Helm 차트 마무리 — PSA(옵션 namespace 템플릿)·lease RBAC·values 정리·신규 플래그·버전 0.5.0
+- [x] README: 설치 가이드, 샘플 `NodePool` / `Machine` YAML, 운영 폴리시 표, 메트릭, 트러블슈팅
+- [ ] **검증**: 빈 클러스터에 `helm install` → E2E #1 / #2 시나리오 통과 (신규 minNodes/maxConcurrent/do-not-disrupt 가드 포함) — 실하드웨어 재검증 대기
 
 ---
 
