@@ -29,9 +29,20 @@ import (
 // minCooldownRequeue on the scale-up path.
 const minConsolidateRequeue = time.Second
 
+// scaleDownBlockedRequeue is how often a node that is empty-and-elapsed but held
+// back by a pool guard (minNodes floor or maxConcurrent cap) is re-checked. The
+// guards depend on other members' state, which does not enqueue this Machine, so
+// a timed re-check is how the drain fires once the floor rises or a slot frees.
+const scaleDownBlockedRequeue = 30 * time.Second
+
 // reasonScaleDown is the Event reason emitted on a Machine when it has stayed
 // empty long enough that ONP triggers its drain and power-off.
 const reasonScaleDown = "ScaleDown"
+
+// reasonScaleDownBlocked is the Event reason emitted on a Machine that is ready to
+// scale down but held back by a pool guard — the minNodes floor or the
+// maxConcurrent cap.
+const reasonScaleDownBlocked = "ScaleDownBlocked"
 
 // ScaleDownReconciler powers off idle nodes: when a Ready Machine in a WhenEmpty
 // pool has carried no evictable workload for the pool's consolidateAfter, it sets
@@ -58,6 +69,7 @@ type ScaleDownReconciler struct {
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -130,13 +142,69 @@ func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
-	// Empty for the whole consolidateAfter: trigger the drain. MachineReconciler
-	// picks up drain-now and runs the cordon -> evict -> power-off path; the next
-	// reconcile here sees the Machine leave Ready and clears emptySince.
-	if err := r.requestDrain(ctx, &m); err != nil {
+	// Empty for the whole consolidateAfter. Before triggering, clear the three
+	// pool-level scale-down guards; any one of them holds the drain back.
+	return r.triggerScaleDown(ctx, &m, pool, after)
+}
+
+// triggerScaleDown applies the pool's scale-down guards and, if all pass, stamps
+// the cooldown anchor and sets drain-now. The guards are evaluated against the
+// pool's current membership at trigger time (not when the timer started), so a
+// node that woke or a drain that finished in the meantime is accounted for.
+func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.Machine, pool *v1alpha1.NodePool, after time.Duration) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// cooldown.scaleDown: rate-limit power-off decisions across the pool, mirroring
+	// cooldown.scaleUp. Requeue exactly when the interval lifts.
+	if until := r.coolingDownUntil(pool); !until.IsZero() {
+		wait := until.Sub(r.Clock.Now())
+		if wait < minConsolidateRequeue {
+			wait = minConsolidateRequeue
+		}
+		logger.V(1).Info("scale-down on cooldown; waiting", "machine", m.Name, "after", wait)
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+
+	members, err := r.poolMembers(ctx, pool)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	r.Recorder.Eventf(&m, corev1.EventTypeNormal, reasonScaleDown,
+	keptOn, scalingDown := poolScaleDownCounts(members)
+
+	// minNodes floor: never drain a node that would drop the pool's kept-on count
+	// below its floor. keptOn includes this Machine (Ready, not yet draining), so
+	// draining it leaves keptOn-1; refuse when that would breach minNodes.
+	if keptOn <= pool.Spec.MinNodes {
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonScaleDownBlocked,
+			"not draining node %q: pool %q at its minNodes floor (%d kept on, min %d)",
+			m.Spec.NodeName, pool.Name, keptOn, pool.Spec.MinNodes)
+		return ctrl.Result{RequeueAfter: scaleDownBlockedRequeue}, nil
+	}
+
+	// maxConcurrent: pace concurrent drains so a wave of idle nodes is retired a
+	// few at a time. A nil cap reads as 1 (the safe default for objects created
+	// before the field existed).
+	maxConcurrent := int32(1)
+	if pool.Spec.Disruption.MaxConcurrent != nil {
+		maxConcurrent = *pool.Spec.Disruption.MaxConcurrent
+	}
+	if scalingDown >= maxConcurrent {
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonScaleDownBlocked,
+			"deferring drain of node %q: pool %q already draining %d (maxConcurrent %d)",
+			m.Spec.NodeName, pool.Name, scalingDown, maxConcurrent)
+		return ctrl.Result{RequeueAfter: scaleDownBlockedRequeue}, nil
+	}
+
+	// All guards pass. Stamp the cooldown anchor before triggering, so a drain that
+	// then fails to patch the Machine has not silently skipped rate-limiting
+	// (mirrors ScaleUpReconciler.stampScaleUp ordering).
+	if err := r.stampScaleDown(ctx, pool); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.requestDrain(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonScaleDown,
 		"node %q empty for %s; draining and powering off", m.Spec.NodeName, after)
 	return ctrl.Result{}, nil
 }
@@ -213,6 +281,84 @@ func consolidateAfter(pool *v1alpha1.NodePool) (time.Duration, bool) {
 		return 0, false
 	}
 	return ca.Duration, true
+}
+
+// poolMembers lists the Machines matching the pool's machineSelector. The scale-
+// down guards count over this set. It mirrors the selector logic the scale-up and
+// nodepool reconcilers use.
+func (r *ScaleDownReconciler) poolMembers(ctx context.Context, pool *v1alpha1.NodePool) ([]v1alpha1.Machine, error) {
+	selector, err := metav1.LabelSelectorAsSelector(&pool.Spec.MachineSelector)
+	if err != nil {
+		return nil, fmt.Errorf("convert machineSelector for nodepool %q: %w", pool.Name, err)
+	}
+	var machines v1alpha1.MachineList
+	if err := r.List(ctx, &machines, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, fmt.Errorf("list machines for pool %q: %w", pool.Name, err)
+	}
+	return machines.Items, nil
+}
+
+// poolScaleDownCounts splits a pool's members into those kept powered on (active
+// and not already being retired) and those already scaling down. keptOn anchors
+// the minNodes floor; scalingDown anchors the maxConcurrent cap. A member already
+// on its way down is counted in scalingDown only, never keptOn, so it neither
+// props up the floor nor is double-counted.
+func poolScaleDownCounts(members []v1alpha1.Machine) (keptOn, scalingDown int32) {
+	for i := range members {
+		m := &members[i]
+		if isScalingDown(m) {
+			scalingDown++
+			continue
+		}
+		if isActive(m) {
+			keptOn++
+		}
+	}
+	return keptOn, scalingDown
+}
+
+// isScalingDown reports whether a Machine is already on its way down: draining,
+// powering off, or triggered to drain by a pending drain-now. Such a member does
+// not count toward the pool's kept-on floor and does count against maxConcurrent.
+func isScalingDown(m *v1alpha1.Machine) bool {
+	switch m.Status.State {
+	case v1alpha1.MachineStateDraining, v1alpha1.MachineStateShuttingDown:
+		return true
+	default:
+		return drainRequested(m)
+	}
+}
+
+// coolingDownUntil returns the instant a pool's scale-down cooldown lifts, or the
+// zero time if the pool is not rate-limited right now (no cooldown configured, no
+// prior scale-down, or the interval has already elapsed). It mirrors the scale-up
+// path's coolingUntil.
+func (r *ScaleDownReconciler) coolingDownUntil(pool *v1alpha1.NodePool) time.Time {
+	cd := pool.Spec.Cooldown.ScaleDown
+	last := pool.Status.LastScaleDownTime
+	if cd == nil || last == nil {
+		return time.Time{}
+	}
+	expiry := last.Time.Add(cd.Duration)
+	if !r.Clock.Now().Before(expiry) {
+		return time.Time{}
+	}
+	return expiry
+}
+
+// stampScaleDown records that ONP just triggered a scale-down in this pool by
+// writing status.LastScaleDownTime, the anchor for cooldown.scaleDown. It uses a
+// MergeFrom status patch so it sends only that one field and does not clobber the
+// membership counts NodePoolReconciler writes. It mirrors
+// ScaleUpReconciler.stampScaleUp.
+func (r *ScaleDownReconciler) stampScaleDown(ctx context.Context, pool *v1alpha1.NodePool) error {
+	orig := pool.DeepCopy()
+	now := metav1.NewTime(r.Clock.Now())
+	pool.Status.LastScaleDownTime = &now
+	if err := r.Status().Patch(ctx, pool, client.MergeFrom(orig)); err != nil {
+		return fmt.Errorf("stamp scale-down time on nodepool %q: %w", pool.Name, err)
+	}
+	return nil
 }
 
 // SetupWithManager wires the reconciler: it reconciles Machines and watches Pods,
