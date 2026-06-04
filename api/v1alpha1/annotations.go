@@ -33,6 +33,20 @@ const (
 	// and reused, so a scale-down cordon must be lifted when the node is woken
 	// back into service or a node woken for a pending pod stays unschedulable.
 	AnnotationCordonedByONP = "onp.io/cordoned-by-onp"
+
+	// AnnotationDoNotDisrupt, set to "true", exempts a workload from ONP's
+	// disruption. On a Node it removes the whole node from automatic scale-down —
+	// ONP never starts its empty timer. On a Pod it protects that pod: the node it
+	// runs on is never auto-targeted for scale-down (the pod keeps the node
+	// non-empty), and a manual drain will not evict it unless drain.force is set —
+	// in which case the drain stalls and times out into Failed rather than
+	// disrupting the pod, the "조용히 데이터를 잃지 않는다" default. It mirrors
+	// Karpenter's karpenter.sh/do-not-disrupt.
+	AnnotationDoNotDisrupt = "onp.io/do-not-disrupt"
+
+	// AnnotationDoNotDisruptValue is the value AnnotationDoNotDisrupt must hold to
+	// take effect. Any other value (or absence) means "may disrupt".
+	AnnotationDoNotDisruptValue = "true"
 )
 
 // Condition types ONP sets on Machine.status.conditions. They follow the

@@ -443,6 +443,45 @@ func TestScaleDownStampsCooldownOnTrigger(t *testing.T) {
 	}
 }
 
+// TestScaleDownSkipsDoNotDisruptNode: a Node marked do-not-disrupt is exempt from
+// automatic scale-down — its empty timer never starts.
+func TestScaleDownSkipsDoNotDisruptNode(t *testing.T) {
+	after := 5 * time.Minute
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:        "node-a",
+		Annotations: map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue},
+	}}
+	pool := whenEmptyPool("edge", &after)
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase)
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, node, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
+		t.Fatal("emptySince stamped for a do-not-disrupt node; scale-down must skip it")
+	}
+}
+
+// TestScaleDownTreatsDoNotDisruptPodAsWorkload: a do-not-disrupt pod keeps its node
+// non-empty, so the node is never auto-targeted — no special case beyond counting
+// the pod as workload.
+func TestScaleDownTreatsDoNotDisruptPodAsWorkload(t *testing.T) {
+	after := 5 * time.Minute
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	pod := sdPod("protected", "node-a", "")
+	pod.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	pool := whenEmptyPool("edge", &after)
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase)
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, pod, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
+		t.Fatal("emptySince stamped despite a do-not-disrupt workload pod; node is not empty")
+	}
+}
+
 // TestScaleDownMachinesForPod maps a pod on a node to the Machine backing it.
 func TestScaleDownMachinesForPod(t *testing.T) {
 	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)

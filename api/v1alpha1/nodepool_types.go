@@ -121,9 +121,13 @@ type DrainSpec struct {
 	// +optional
 	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
 
-	// Force, when true, lets the drain evict do-not-disrupt / PDB-blocked Pods
-	// after the timeout. It defaults to false: deleting data without an explicit
-	// opt-in is exactly the "silently lose data" default ONP refuses to ship.
+	// Force, when true, lets the drain evict do-not-disrupt Pods, which an unforced
+	// drain skips — the explicit opt-in an operator gives to disrupt protected
+	// workloads. Eviction still goes through the Eviction API, so a
+	// PodDisruptionBudget is honored even under force; hard-deleting PDB-blocked
+	// Pods after the timeout is deliberately left to a later phase. It defaults to
+	// false: disrupting protected workloads without an explicit opt-in is exactly
+	// the "silently lose data" default ONP refuses to ship.
 	// +optional
 	Force bool `json:"force,omitempty"`
 }

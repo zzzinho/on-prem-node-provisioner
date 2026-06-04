@@ -708,6 +708,61 @@ func TestReconcileDrainingBlockedEvictionStaysDraining(t *testing.T) {
 	}
 }
 
+// doNotDisruptPod returns a plain workload pod carrying the do-not-disrupt
+// annotation.
+func doNotDisruptPod(name, nodeName string) *corev1.Pod {
+	p := normalPod(name, nodeName)
+	p.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	return p
+}
+
+// TestReconcileDrainingSkipsDoNotDisruptPod: an unforced drain must not evict a
+// do-not-disrupt pod, and the pod keeps the node non-empty, so the Machine stays
+// Draining (it later times out into Failed) rather than powering off the node.
+func TestReconcileDrainingSkipsDoNotDisruptPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	f := newFixture(t, m, readyNode("node-a"), doNotDisruptPod("protected-1", "node-a"))
+
+	res := f.reconcile(t)
+
+	if res.RequeueAfter != drainPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v (protected pod blocks completion)", res.RequeueAfter, drainPollInterval)
+	}
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none (do-not-disrupt pod must not be evicted)", f.evicted)
+	}
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateDraining {
+		t.Errorf("state = %q, want Draining (node not empty while protected pod runs)", got.Status.State)
+	}
+}
+
+// TestReconcileDrainingForceEvictsDoNotDisruptPod: drain.force=true lifts the
+// do-not-disrupt exemption — the pod is evicted like any other workload.
+func TestReconcileDrainingForceEvictsDoNotDisruptPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	m.Labels = map[string]string{"pool": "a"}
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	pool := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
+	pool.Spec.Drain.Force = true
+
+	f := newFixture(t, m, readyNode("node-a"), pool, doNotDisruptPod("protected-1", "node-a"))
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 1 || f.evicted[0] != "protected-1" {
+		t.Errorf("evicted = %v, want [protected-1] (force evicts do-not-disrupt pods)", f.evicted)
+	}
+}
+
 func TestDrainTimeoutResolution(t *testing.T) {
 	t.Parallel()
 
@@ -737,12 +792,12 @@ func TestDrainTimeoutResolution(t *testing.T) {
 			m.Labels = tt.labels
 			f := newFixture(t, append([]client.Object{m}, tt.pools...)...)
 
-			got, err := f.r.drainTimeout(context.Background(), m)
+			got, _, err := f.r.drainPolicy(context.Background(), m)
 			if err != nil {
-				t.Fatalf("drainTimeout() error: %v", err)
+				t.Fatalf("drainPolicy() error: %v", err)
 			}
 			if got != tt.want {
-				t.Errorf("drainTimeout() = %v, want %v", got, tt.want)
+				t.Errorf("drainPolicy() timeout = %v, want %v", got, tt.want)
 			}
 		})
 	}
