@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
+	"github.com/zzzinho/on-prem-node-provisioner/internal/metrics"
 	"github.com/zzzinho/on-prem-node-provisioner/internal/power"
 )
 
@@ -198,6 +199,7 @@ func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machin
 	}
 
 	if err := provider.PowerOn(ctx, m); err != nil {
+		metrics.RecordPowerOn(m.Spec.Power.Provider, err)
 		// Agent unreachable, bad config, etc. Stay Off, warn, and let
 		// controller-runtime requeue with backoff so the next reconcile retries.
 		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonPowerOnFailed,
@@ -210,6 +212,7 @@ func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machin
 		return ctrl.Result{}, fmt.Errorf("power-on machine %q: %w", m.Name, err)
 	}
 
+	metrics.RecordPowerOn(m.Spec.Power.Provider, nil)
 	now := metav1.NewTime(r.Clock.Now())
 	m.Status.State = v1alpha1.MachineStateBooting
 	m.Status.BootStartTime = &now
@@ -232,6 +235,10 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
 	if ready {
+		// Record the wake latency before clearing the anchor: power-on -> Ready.
+		if m.Status.BootStartTime != nil {
+			metrics.ObserveScaleUpLatency(r.Clock.Since(m.Status.BootStartTime.Time))
+		}
 		// A node ONP cordoned during a prior scale-down is being woken back into
 		// service; lift that cordon so it can host pods again. An operator's manual
 		// cordon (no onp.io/cordoned-by-onp marker) is left alone.
@@ -389,6 +396,7 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 		}
 		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainTimeout,
 			"Node %q did not drain within %s; uncordoned and marked Failed", m.Spec.NodeName, timeout)
+		metrics.RecordDrainFailure(metrics.ReasonDrainTimeout)
 		return ctrl.Result{}, nil
 	}
 
@@ -474,6 +482,7 @@ func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alph
 			}
 			r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonShutdownTimeout,
 				"Node %q did not power off within %s; marked Failed", m.Spec.NodeName, r.ShutdownTimeout)
+			metrics.RecordDrainFailure(metrics.ReasonShutdownTimeout)
 			return ctrl.Result{}, nil
 		}
 		// Requeue to keep polling; the Node watch will also enqueue us on the

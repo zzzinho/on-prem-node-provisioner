@@ -20,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	onpv1alpha1 "github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
@@ -169,6 +170,11 @@ func main() {
 		log.Error(err, "unable to set up scale-down reconciler")
 		os.Exit(1)
 	}
+
+	// The current-state gauges (onp_nodes_total, onp_pending_unschedulable) are
+	// computed at scrape time from the manager's cache; the event-driven metrics
+	// register themselves in internal/metrics' init.
+	ctrlmetrics.Registry.MustRegister(controller.NewStateCollector(mgr.GetClient()))
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
