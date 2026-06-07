@@ -188,7 +188,9 @@
 - [x] Status Conditions 표준화 (`PowerOnSucceeded`, `DrainSucceeded`, `Ready`) — `setCondition` 표준 패턴
 - [x] `charts/onp/` Helm 차트 마무리 — PSA(옵션 namespace 템플릿)·lease RBAC·values 정리·신규 플래그·버전 0.5.0
 - [x] README: 설치 가이드, 샘플 `NodePool` / `Machine` YAML, 운영 폴리시 표, 메트릭, 트러블슈팅
-- [ ] **검증**: 빈 클러스터에 `helm install` → E2E #1 / #2 시나리오 통과 (신규 minNodes/maxConcurrent/do-not-disrupt 가드 포함) — 실하드웨어 재검증 대기
+- [x] **검증 (E2E #3)** — 실하드웨어 전수 통과 (2026-06-06, 차트 0.5.0 배포, microk8s desktop/desktop1). 12개 Phase + auto-uncordon: 설치/CRD, leader election, 메트릭 5종, 실 WoL wake(×4)·scale-up latency, minNodes 하한, 실 poweroff(×3), do-not-disrupt Pod/Node, drain.force, A1 shutdown 타임아웃, A2 노드 손실, cooldown.scaleDown 모두 관측. 목적 기능(wake / scale-down / do-not-disrupt / force) 재현 절차는 `docs/e2e/`.
+  - `maxConcurrent` 직렬화는 단일 wakeable 노드라 미관측(단위 테스트 `TestScaleDownDefersAtMaxConcurrent` 커버).
+  - **발견**: (1) Helm 은 `helm upgrade` 시 `crds/` 를 갱신하지 않음 → 업그레이드 후 `kubectl apply -f charts/onp/crds/` 필요. (2) 관리 노드는 NodePool `template.labels` 를 실제로 carry 해야 wake 후 스케줄됨(운영자 책임). 둘 다 README 트러블슈팅 반영 권장.
 
 ---
 
