@@ -118,6 +118,8 @@ ONP 의 기본값은 **"조용히 데이터를 잃지 않는다"** 입니다 —
 - **scale-up 으로 깨운 노드가 스케줄 안 됨**: 이전 scale-down 이 남긴 cordon 일 수 있습니다. ONP 는 `Booting→Ready` 에서 **자기가 단 cordon(`onp.io/cordoned-by-onp`)만** 자동 해제합니다 (운영자 수동 cordon 은 건드리지 않음).
 - **shutdown-agent 가 안 뜸**: 대상 노드에 `onp.io/managed=true` 라벨이 있는지, 네임스페이스가 privileged PSA 를 허용하는지 확인하세요.
 - **자동 scale-down 이 안 일어남**: `disruption.consolidationPolicy: WhenEmpty` **와** `consolidateAfter` 가 **둘 다** 설정돼야 합니다 (둘 중 하나라도 없으면 off — 의도된 안전 기본값).
+- **차트 업그레이드 후 새 CRD 필드가 안 보임 / 컨트롤러가 `unknown field` 로그**: Helm 은 `helm upgrade` 시 `crds/` 의 CRD 를 **갱신하지 않습니다**(최초 install 만). 새 필드가 적용 안 돼 상태 머신 일부가 동작하지 않을 수 있습니다. 업그레이드 후 **`kubectl apply -f charts/onp/crds/`** 를 명시적으로 실행하세요. (`kubectl explain` 은 클라이언트 OpenAPI 캐시 때문에 직후 stale 일 수 있음 — `rm -rf ~/.kube/cache` 후 재확인.)
+- **깨운 노드에 파드가 안 붙음 (라벨)**: `nodeSelector`/affinity 로 풀을 고른 파드는 **실제 Node 가 그 라벨을 carry** 해야 스케줄됩니다. ONP 의 fit 시뮬레이션은 `NodePool.template.labels` 로 노드를 깨우지만, 노드 라벨링 자체는 운영자 책임입니다(노드 셋업은 Non-Goals). 관리 노드에 `kubectl label node <n> onp.io/pool=<pool>` 로 풀 라벨을 부여하세요. (이전 cordon 이 원인인 경우는 위 항목 참고.)
 
 ## 아키텍처
 
