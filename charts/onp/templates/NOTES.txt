@@ -5,14 +5,24 @@ Images (pulled anonymously from {{ .Values.image.registry }}):
   controller: {{ include "onp.image" (dict "root" $ "name" .Values.controller.name) }}
   wol-agent:  {{ include "onp.image" (dict "root" $ "name" .Values.wolAgent.name) }}
 
-1) Label every ALWAYS-ON node (control plane / nodes that never power off) so
-   the controller and wol-agent land there:
+1) Label your nodes so each ONP component lands where it must:
 
+     # always-on nodes (control plane / never power off) host the controller + wol-agent
      kubectl label node <always-on-node> onp.io/always-on=true
+     # wakeable nodes ONP powers on/off host the shutdown-agent
+     kubectl label node <wakeable-node>  onp.io/managed=true
 
-   Verify both workloads scheduled:
+   Verify the workloads scheduled:
 
      kubectl -n {{ .Release.Namespace }} get deploy,ds,svc -l app.kubernetes.io/instance={{ .Release.Name }}
+
+{{- if not .Values.namespace.create }}
+
+   NOTE: the shutdown-agent is privileged. If this cluster enforces Pod Security
+   Admission, label the namespace so it may schedule:
+
+     kubectl label ns {{ .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged
+{{- end }}
 
 2) Register a Machine for each WAKEABLE physical node. The Machine is cluster-
    scoped; capacity is the source of truth for fit checks while the node is off:
