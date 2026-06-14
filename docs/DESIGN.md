@@ -74,7 +74,7 @@ Phase 1에서 의도적으로 다루지 않는 항목 — IPMI/Redfish provider 
 - **안전한 스케일 다운**: 노드가 비어 있고 `consolidateAfter` 동안 유지되면 cordon → drain → 전원 off 순서로 줄인다. PDB(`PodDisruptionBudget`)를 존중하고, drain이 막히면 멈춘다.
 - **선언적 CRD 모델**: 노드 풀의 정책은 `NodePool` 로, 개별 물리 노드의 신원/전원 메타데이터는 `Machine` 으로 표현한다. 정적 config 파일이 아니라 Kubernetes 객체로 관리한다.
 - **Pluggable Power Provider**: 전원 제어는 `PowerProvider` 인터페이스 뒤에 숨긴다. Phase 1은 WoL 구현 하나만 싣지만, IPMI/Redfish/스크립트 등 다른 백엔드를 같은 모양으로 끼울 수 있다.
-- **운영 안전장치**: NodePool 단위 `minNodes` 하한 보장, 노드 단위 `onp.io/do-not-disrupt` opt-out, drain `timeoutSeconds` 설정 가능. 기본값은 모두 "보수적으로 안전한 쪽".
+- **운영 안전장치**: NodePool 단위 `minNodes` 하한 / `maxConcurrent` 동시 drain 상한, Node/Pod 단위 `onp.io/do-not-disrupt` opt-out, `cooldown.scaleDown`, drain `timeoutSeconds` 설정 가능. 기본값은 모두 "보수적으로 안전한 쪽".
 - **표준 관측성**: `/metrics` 엔드포인트로 Prometheus 호환 메트릭(스케일 결정, 노드 상태 전이, drain 결과 등)을 노출한다.
 
 ### Non-Goals
@@ -260,7 +260,7 @@ sequenceDiagram
     Sched->>API: bind Pod → Node
 ```
 
-`bootTimeout` (NodePool 설정, 기본 10분) 내에 Node Ready 가 관찰되지 않으면 컨트롤러는 `Machine.status.state = Failed` 로 옮기고 Event를 발생시킨다. 재시도 정책은 Phase 2.
+boot timeout (컨트롤러 플래그 `--boot-timeout`, 기본 10분) 내에 Node Ready 가 관찰되지 않으면 컨트롤러는 `Machine.status.state = Failed` 로 옮기고 Event를 발생시킨다. 풀 단위가 아니라 컨트롤러 전역 설정인 이유는, 부트 SLA 가 워크로드 정책(`NodePool`)이 아니라 하드웨어·BIOS·네트워크 특성에 달려 있어 배포 단위로 한 번 정하는 게 자연스럽기 때문이다. 재시도 정책은 Phase 2.
 
 **Cordon 수명주기 (scale-down ↔ scale-up 연결).** scale-down 이 cordon 한 노드는 `Draining → ShuttingDown → Off` 내내 cordon 된 채로 전원이 꺼지고, 이후 scale-up 으로 다시 깨어나 `Ready` 가 될 때 컨트롤러가 자동으로 uncordon 한다. Phase 1 노드는 long-lived 라 같은 Node 객체가 재사용되므로, cordon 을 안 풀면 깨운 노드가 `unschedulable` 로 남아 정작 깨운 원인이 된 pending 파드를 못 받는다. 운영자가 손으로 cordon 한 노드까지 풀어버리지 않도록, ONP 는 자기가 cordon 할 때 Node 에 `onp.io/cordoned-by-onp` 마커를 달고 wake 시 **마커가 있는 노드만** uncordon 한다 (drain timeout 경로의 uncordon 도 같은 마커를 지운다). 클라우드 오토스케일러가 노드를 통째로 버리고 새로 만드는 것과 달리, on-prem 의 "같은 노드를 껐다 켠다" 모델에서 생기는 고유한 수명주기다.
 
@@ -379,8 +379,8 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 
 세 컴포넌트는 각자 다른 권한 표면을 가진다. 권한은 모두 **그 컴포넌트가 자기 일을 하는 데 필요한 최소치**로 제한한다.
 
-- **onp-shutdown-agent**: `privileged: true`, `hostPID`, `hostIPC` — `systemctl poweroff` 를 호스트 init 에 전달하려면 필요하다. 블래스트 반경은 두 가지로 통제한다. (a) Pod Security Admission `privileged` 네임스페이스로 격리 — 다른 워크로드가 같은 PSA 레벨로 흘러들지 않도록. (b) RBAC 는 **자기 호스트에 해당하는 `Machine` 의 read-only** 권한만. agent 가 다른 노드의 Machine 을 보거나 수정할 수 없다.
-- **onp-wol-agent**: `hostNetwork: true`. HTTP 포트가 호스트 NIC 에 노출되므로 NetworkPolicy 로 컨트롤러 파드의 트래픽만 허용. 컨트롤 플레인 노드 외부에서 도달 불가능해야 한다.
+- **onp-shutdown-agent**: `privileged: true`, `hostPID` — `nsenter` 로 호스트 PID 1 의 namespace 에 진입해 호스트의 `systemctl poweroff` 를 실행하려면 필요하다. 블래스트 반경은 두 가지로 통제한다. (a) Pod Security Admission `privileged` 네임스페이스로 격리 — 다른 워크로드가 같은 PSA 레벨로 흘러들지 않도록. (b) RBAC 는 `Machine` read-only 만. cluster-wide list/watch 권한은 갖되, agent 코드가 **자기 호스트(`spec.nodeName == $NODE_NAME`)에 해당하는 Machine 만** 처리하도록 필터링하고, 어떤 Machine 도 수정하지 않는다 (전원 차단은 로컬 명령이고, 상태 갱신은 컨트롤러 몫).
+- **onp-wol-agent**: `hostNetwork: true`. HTTP 포트가 호스트 NIC 에 노출된다. `hostNetwork` 파드는 CNI 를 우회하므로 NetworkPolicy 로 보호되지 않는다 — 그래서 컨트롤러와 agent 가 **공유 bearer token** 으로 인증한다 (Helm 이 생성·persist 하는 Secret, 양쪽에 주입). 토큰 없는 요청은 `401` 로 거절하고, 비교는 constant-time. 페이로드는 `MaxBytesReader` 로 제한한다. agent 는 매직 패킷 송신 외에 아무 권한도 없어, 토큰이 새어도 블래스트 반경은 "임의 MAC 으로 wake 패킷 송신" 에 그친다.
 - **onp-controller**: RBAC 최소화 — Pod / Node read, Pod eviction, `NodePool` / `Machine` read-write, Lease (leader election) read-write. Secret 접근은 Phase 1 에 없다 (WoL 은 자격 증명 불요).
 
 **미래 provider 의 credentials**. IPMI / Redfish provider 가 들어오면 BMC 자격 증명이 필요해진다. 원칙은 **credentials 는 provider 코드 안에 머무름** — 컨트롤러 핵심은 credential 을 보지 않는다. 구체적으로는 provider 별로 `Secret` 참조를 `Machine.spec.power.<provider>` 에 두고, provider 구현이 자기 Secret 만 읽는 RBAC 로 분리한다 (Phase 2 설계 시 구체화).
@@ -390,11 +390,11 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 운영자가 ONP 의 행동을 외부에서 관찰할 수 있어야 한다. 세 채널로 노출한다.
 
 **Metrics (`/metrics`, Prometheus 호환)**
-- `onp_nodes_total{pool, state}` — 풀별 상태별 노드 수 (gauge).
+- `onp_nodes_total{pool, state}` — 풀별 상태별 노드 수 (gauge, scrape 시점 collector).
 - `onp_scale_up_latency_seconds` — pending 감지 → Node Ready 까지 (histogram).
-- `onp_power_on_total{provider, result}` / `onp_power_off_total{provider, result}` — 전원 명령 발행 카운터.
-- `onp_drain_failure_total{reason}` — drain 실패 사유별 카운터 (`pdb_blocked`, `timeout`, `eviction_error` 등).
-- `onp_pending_unschedulable` — 시스템이 인지한 큐잉된 파드 수 (gauge).
+- `onp_power_on_total{provider, result}` — 전원 켜기 명령 발행 카운터. (대칭인 `onp_power_off_total` 은 Phase 1 에 없다 — 끄기 경로가 `provider.PowerOff` 가 아니라 shutdown-agent 의 로컬 `poweroff` 라, agent 가 `PoweringOff` Event 를 발행한다. provider 기반 hard-cut 이 들어오는 Phase 2 에서 추가.)
+- `onp_drain_failure_total{reason}` — drain/shutdown 이 깨끗이 끝나지 못한 횟수, 사유별 카운터 (`drain_timeout` | `shutdown_timeout`).
+- `onp_pending_unschedulable` — 시스템이 인지한 큐잉된 파드 수 (gauge, scrape 시점 collector).
 
 **Kubernetes Events**: `Machine` / `NodePool` / 관련 `Pod` 에 발생. 운영자가 `kubectl describe machine node-a01` 만으로도 흐름을 따라갈 수 있어야 한다.
 
@@ -422,7 +422,8 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 | Drain 행 (PDB 등) | `Failed` + uncordon + Event | `force=true` opt-in 시 강제 진행 |
 | 컨트롤러 재시작 | reconcile 재개 — `Machine.status` 가 source of truth | CRD-driven 상태 머신의 이점 |
 | onp-wol-agent 도달 불가 | Wake HTTP 요청 실패 → backoff retry → 일정 횟수 후 Machine Event | 컨트롤러는 Booting 상태로 옮기지 않고 Off 유지 |
-| onp-shutdown-agent 도달 불가 | `ShuttingDown` 상태가 stuck → Event | Phase 2: provider.PowerOff fallback |
+| onp-shutdown-agent 도달 불가 / 노드가 안 꺼짐 | shutdown timeout(`--shutdown-timeout`, 기본 5분) 초과 시 `Failed` + Event(`onp_drain_failure_total{reason="shutdown_timeout"}`) | Phase 2: provider.PowerOff hard-cut fallback |
+| Ready 노드가 외부 요인으로 NotReady | grace(`--node-loss-grace-period`, 기본 1분) 후 `Off` + Event | scale-up 이 pending 파드로 자연 복구. flap 방지용 grace |
 
 원칙은 일관된다: **모호한 성공은 만들지 않는다**. 의심스러우면 `Failed` 로 옮기고 사람을 부른다.
 

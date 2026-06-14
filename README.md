@@ -4,7 +4,7 @@ Pending 파드의 spec 을 보고 적합한 on-prem 물리 노드를 Wake-on-LAN
 
 ## 상태
 
-**Phase 1 (MVP) 코드 완료** — M1~M5 구현 완료. M5 의 클린 클러스터 E2E 재검증만 남았습니다.
+**Phase 1 (MVP) 코드 완료** — M1~M5 구현 + DESIGN/CLAUDE 불변식 정합성 패스(C1~C7) 완료. 단위 테스트 통과, 정합성 패스의 클린 클러스터 E2E 재검증만 남았습니다.
 
 - ✅ **M1 — Walking Skeleton**: WoL 매직 패킷 빌더 + `wol-probe` CLI (표준 라이브러리만) + 멀티스테이지 Docker 이미지. 같은 L2 의 실제 꺼진 노드를 깨우는 것까지 end-to-end 검증 완료.
 - ✅ **M2 — 최소 컨트롤러**: `Machine` CRD + 컨트롤러 + `onp-wol-agent` 로 선언적 wake (`onp.io/wake-now` 어노테이션).
@@ -23,16 +23,20 @@ Pending 파드의 spec 을 보고 적합한 on-prem 물리 노드를 Wake-on-LAN
 kubectl label node <always-on-node> onp.io/always-on=true   # 컨트롤러 + wol-agent (항상 켜진 노드)
 kubectl label node <wakeable-node>  onp.io/managed=true      # shutdown-agent (ONP 가 켜고 끄는 노드)
 
-# 2) 설치 (이미지는 익명 pull 가능한 레지스트리에서. 기본 registry 는 ghcr.io/onp — 자체 레지스트리는 --set 으로 override)
+# 2) 설치 (차트 기본 이미지 경로는 ghcr.io/zzzinho/<component>. 아직 prebuilt 이미지를
+#    배포하지 않으므로, 클러스터가 pull 할 수 있는 레지스트리로 직접 빌드·푸시한 뒤
+#    image.registry/repository 를 override 하세요. Makefile 의 docker-build/docker-push 참고.)
 helm install onp ./charts/onp -n onp-system --create-namespace \
-  --set image.registry=<your-registry>
+  --set image.registry=<your-registry> --set image.repository=<your-namespace>
 
 # PSA 를 강제하는 클러스터라면 privileged shutdown-agent 가 뜨도록 네임스페이스 라벨링
 kubectl label ns onp-system pod-security.kubernetes.io/enforce=privileged
 ```
 
 > 이미지를 직접 빌드한다면: controller/wol-agent 는 기본 타깃, **shutdown-agent 는 privileged 런타임**으로 빌드해야 합니다 (`nsenter` 필요) —
-> `docker build --target runtime-privileged --build-arg BIN=onp-shutdown-agent ...`.
+> `make docker-build docker-push REGISTRY=<your-registry> TAG=<tag>` 가 셋을 알맞은 타깃으로 빌드합니다.
+>
+> **wol-agent 인증**: 컨트롤러↔wol-agent 는 공유 bearer token 으로 인증하며, 차트가 토큰 Secret 을 자동 생성·persist 합니다 (`wolAgent.auth.enabled=true` 기본). 별도 설정 없이 동작하고, 기존 Secret 을 쓰려면 `wolAgent.auth.existingSecret` 으로 지정합니다.
 
 ### 샘플 매니페스트
 
@@ -119,7 +123,7 @@ ONP 의 기본값은 **"조용히 데이터를 잃지 않는다"** 입니다 —
 - **shutdown-agent 가 안 뜸**: 대상 노드에 `onp.io/managed=true` 라벨이 있는지, 네임스페이스가 privileged PSA 를 허용하는지 확인하세요.
 - **자동 scale-down 이 안 일어남**: `disruption.consolidationPolicy: WhenEmpty` **와** `consolidateAfter` 가 **둘 다** 설정돼야 합니다 (둘 중 하나라도 없으면 off — 의도된 안전 기본값).
 - **차트 업그레이드 후 새 CRD 필드가 안 보임 / 컨트롤러가 `unknown field` 로그**: Helm 은 `helm upgrade` 시 `crds/` 의 CRD 를 **갱신하지 않습니다**(최초 install 만). 새 필드가 적용 안 돼 상태 머신 일부가 동작하지 않을 수 있습니다. 업그레이드 후 **`kubectl apply -f charts/onp/crds/`** 를 명시적으로 실행하세요. (`kubectl explain` 은 클라이언트 OpenAPI 캐시 때문에 직후 stale 일 수 있음 — `rm -rf ~/.kube/cache` 후 재확인.)
-- **깨운 노드에 파드가 안 붙음 (라벨)**: `nodeSelector`/affinity 로 풀을 고른 파드는 **실제 Node 가 그 라벨을 carry** 해야 스케줄됩니다. ONP 의 fit 시뮬레이션은 `NodePool.template.labels` 로 노드를 깨우지만, 노드 라벨링 자체는 운영자 책임입니다(노드 셋업은 Non-Goals). 관리 노드에 `kubectl label node <n> onp.io/pool=<pool>` 로 풀 라벨을 부여하세요. (이전 cordon 이 원인인 경우는 위 항목 참고.)
+- **깨운 노드에 파드가 안 붙음 (라벨)**: `nodeSelector`/affinity 로 풀을 고른 파드는 **실제 Node 가 그 라벨을 carry** 해야 스케줄됩니다. ONP 는 노드가 `Ready` 가 될 때 `NodePool.template.labels`(Machine `spec.labels` 로 덮어씀)와 `template.taints` 를 그 Node 에 적용하므로, 풀 라벨은 보통 자동으로 붙습니다. 파드가 요구하는 라벨이 안 붙는다면 그 라벨을 `NodePool.template.labels` 또는 `Machine.spec.labels` 에 추가하세요 (ONP 는 선언한 것만 더하며, 운영자가 손으로 단 라벨은 지우지 않습니다). (이전 cordon 이 원인인 경우는 위 항목 참고.)
 
 ## 아키텍처
 
