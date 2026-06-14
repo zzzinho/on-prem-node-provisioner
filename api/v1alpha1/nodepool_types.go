@@ -89,6 +89,17 @@ type DisruptionSpec struct {
 	// soon as the node is observed empty.
 	// +optional
 	ConsolidateAfter *metav1.Duration `json:"consolidateAfter,omitempty"`
+
+	// MaxConcurrent caps how many of the pool's nodes ONP may have draining (or
+	// already powering off) at once, so a wave of idle nodes is retired one or a
+	// few at a time rather than all together. It defaults to 1: serial scale-down
+	// is the least surprising, safest behavior, and an operator opts into more
+	// disruption explicitly. A nil pointer is read as 1 by the controller so
+	// objects created before this field existed keep that safe default.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	// +optional
+	MaxConcurrent *int32 `json:"maxConcurrent,omitempty"`
 }
 
 // CooldownSpec rate-limits scale decisions. Consumed in M3.3/M5.
@@ -110,9 +121,13 @@ type DrainSpec struct {
 	// +optional
 	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
 
-	// Force, when true, lets the drain evict do-not-disrupt / PDB-blocked Pods
-	// after the timeout. It defaults to false: deleting data without an explicit
-	// opt-in is exactly the "silently lose data" default ONP refuses to ship.
+	// Force, when true, lets the drain evict do-not-disrupt Pods, which an unforced
+	// drain skips — the explicit opt-in an operator gives to disrupt protected
+	// workloads. Eviction still goes through the Eviction API, so a
+	// PodDisruptionBudget is honored even under force; hard-deleting PDB-blocked
+	// Pods after the timeout is deliberately left to a later phase. It defaults to
+	// false: disrupting protected workloads without an explicit opt-in is exactly
+	// the "silently lose data" default ONP refuses to ship.
 	// +optional
 	Force bool `json:"force,omitempty"`
 }
@@ -133,6 +148,12 @@ type NodePoolStatus struct {
 	// anchors cooldown.scaleUp rate-limiting. Nil means no scale-up yet.
 	// +optional
 	LastScaleUpTime *metav1.Time `json:"lastScaleUpTime,omitempty"`
+
+	// LastScaleDownTime is when ONP most recently triggered a drain/power-off of a
+	// Machine in this pool; it anchors cooldown.scaleDown rate-limiting, mirroring
+	// LastScaleUpTime. Nil means no scale-down yet.
+	// +optional
+	LastScaleDownTime *metav1.Time `json:"lastScaleDownTime,omitempty"`
 
 	// Conditions follow the standard Kubernetes condition pattern.
 	// +listType=map

@@ -52,8 +52,8 @@ func TestWoLProviderUnsupported(t *testing.T) {
 	if !errors.Is(err, ErrUnsupported) {
 		t.Errorf("PowerStatus() err = %v, want ErrUnsupported", err)
 	}
-	if state != "" {
-		t.Errorf("PowerStatus() state = %q, want empty", state)
+	if state != StateUnknown {
+		t.Errorf("PowerStatus() state = %q, want %q", state, StateUnknown)
 	}
 }
 

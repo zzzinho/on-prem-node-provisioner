@@ -149,7 +149,7 @@
 - [x] Empty 노드 감지 (DaemonSet / static pod 제외) — M4.2 (`status.emptySince` 앵커, drain 완료 판정과 동일한 evictable 정의 공유 — DaemonSet/mirror/terminating/finished 제외, fake-clock 단위 테스트)
 - [x] cordon → Eviction API (PDB 존중) → `state=ShuttingDown` — M4.1 (`onp.io/drain-now` 트리거, DaemonSet/mirror/terminating 제외, Eviction 주입형으로 단위 테스트)
 - [x] `drain.timeoutSeconds` (기본 300s, NodePool 해석) 초과 시 `state=Failed` + uncordon + Event (`force=false` 기본) — M4.1
-- [ ] PSA `privileged` 네임스페이스 격리 매니페스트
+- [x] PSA `privileged` 네임스페이스 격리 매니페스트 — M5.4 에서 옵션 `namespace.yaml`(`createNamespace` 게이트) + NOTES/README 의 `kubectl label ns ... enforce=privileged` 안내로 완료
 - [x] Node NotReady 감지 시 `state=Off` 전이 — M4.0 (MachineReconciler `ShuttingDown→Off`, 실하드웨어 검증: agent `PoweringOff` → controller `PoweredOff`)
 - [x] **검증 (E2E #2)** — 실하드웨어 통과 (2026-06-03, 차트 0.4.0 배포). 두 경로 모두 검증:
   - **성공경로**: 빈 노드(desktop1) → `consolidateAfter` 60s 경과 → `ScaleDown` 이벤트("empty for 1m0s") → 자동 `drain-now` → `Draining`(빈 노드라 즉시) → `DrainSucceeded` → shutdown-agent `PoweringOff` → Node NotReady → `state=Off`. 재기상(실 WoL 부팅 ~54s)으로 복구.
@@ -162,23 +162,49 @@
 
 **Definition of Done**: `helm install onp ./charts/onp` 한 번으로 클린 클러스터에서 전체 동작. 운영 안전장치(minNodes, cooldown, do-not-disrupt, maxConcurrent) 모두 작동. `/metrics` 로 핵심 메트릭 노출. README 만으로 다른 사람이 설치 가능.
 
-- [ ] `minNodes` 하한 보장 — 풀이 minNodes 아래로 내려가는 스케일 다운 거절
-- [ ] `maxConcurrent` — 풀당 동시 Draining 노드 수 제한 (기본 1)
-- [ ] `onp.io/do-not-disrupt` 어노테이션 (Node/Pod 단위) 존중
-- [ ] `cooldown.scaleDown` 적용
-- [ ] **wake→Ready 시 자동 uncordon** (E2E #2 에서 발견) — scale-down 이 cordon 한 long-lived 노드를 다시 깨우면 cordon 이 남아 scale-up 으로 깨운 노드가 unschedulable 로 남는다. `Booting→Ready` 전이에서 ONP 가 직접 cordon 한 노드를 uncordon (운영자가 수동 cordon 한 경우와 구분 필요).
-- [ ] Leader election (`coordination.k8s.io/Lease`)
-- [ ] `/metrics` 노출:
-  - [ ] `onp_nodes_total{pool, state}` (gauge)
-  - [ ] `onp_scale_up_latency_seconds` (histogram)
-  - [ ] `onp_power_on_total{provider, result}` (counter)
-  - [ ] `onp_drain_failure_total{reason}` (counter)
-  - [ ] `onp_pending_unschedulable` (gauge)
-- [ ] Kubernetes Events 발행 (Machine / NodePool / 관련 Pod)
-- [ ] Status Conditions 표준화 (`PowerOnSucceeded`, `DrainSucceeded`, `Ready`)
-- [ ] `charts/onp/` Helm 차트 마무리 — M2~M4 에서 누적된 차트(controller + wol-agent + shutdown-agent + CRD + RBAC)에 PSA·values 정리·packaging·버전 태깅 추가
-- [ ] README: 설치 가이드, 샘플 `NodePool` / `Machine` YAML, 트러블슈팅
-- [ ] **검증**: 빈 클러스터에 `helm install` → E2E #1 / #2 시나리오 통과
+**기반 결정 / 리뷰 반영** (M5 착수 시 확정):
+
+- M4 직후 전체 코드 리뷰 → destructive path 는 안전(Eviction/PDB/force-off/노드 신원 이중방어)하나 운영 안전장치 미구현 확인. minNodes 하한이 1순위 갭.
+- 스키마 4필드 추가 (모두 additive): `disruption.maxConcurrent`(기본 1), `status.lastScaleDownTime`, Machine `status.shutdownStartTime`/`notReadySince`.
+- 리뷰에서 나온 상태머신 갭 2개 포함: **A1** shutdown 타임아웃→`Failed`, **A2** 외부 노드 손실 시 grace 후 `Ready→Off`.
+- emptiness ↔ evictability 분리 (`isWorkload` vs `isDrainable`) — do-not-disrupt 를 단일 술어에 넣는 함정 회피.
+- Leader election 은 wiring + lease RBAC 만, 차트 기본은 1 replica / off (전원 컨트롤러는 단일 결정자가 안전).
+
+- [x] `minNodes` 하한 보장 — 풀이 minNodes 아래로 내려가는 스케일 다운 거절 (`ScaleDownReconciler.triggerScaleDown`, keptOn 카운트는 in-flight drain 제외)
+- [x] `maxConcurrent` — 풀당 동시 Draining 노드 수 제한 (기본 1, `disruption.maxConcurrent` nil→1)
+- [x] `onp.io/do-not-disrupt` 어노테이션 (Node/Pod 단위) 존중 — Node=scale-down 제외, Pod=노드 non-empty 취급 + 수동 drain hard-guard (force 아니면 evict 안 함→timeout→Failed)
+- [x] `cooldown.scaleDown` 적용 (`status.lastScaleDownTime` 앵커, `stampScaleDown`/`coolingDownUntil` = scaleUp 대칭)
+- [x] **wake→Ready 시 자동 uncordon** (E2E #2 에서 발견) — `Booting→Ready` 에서 `onp.io/cordoned-by-onp` 마커가 붙은 ONP 자신의 cordon 만 해제 (운영자 수동 cordon 과 구분). M4 단계에서 선반영됨.
+- [x] **A1 — shutdown 타임아웃** (리뷰): `ShuttingDown` 에서 Node 가 `--shutdown-timeout`(기본 5m) 내 NotReady 안 되면 `Failed` (무한 폴링 제거).
+- [x] **A2 — 외부 노드 손실** (리뷰): `Ready` Machine 의 Node 가 ONP drain 없이 NotReady → `--node-loss-grace-period`(기본 1m) 후 `Off` (scale-up 이 자연 복구; blip 흡수).
+- [x] Leader election (`coordination.k8s.io/Lease`) — wiring + `LeaderElectionReleaseOnCancel` + 조건부 lease RBAC. 차트 기본 1 replica/off.
+- [x] `/metrics` 노출 (`onp_` 5종, controller-runtime 레지스트리):
+  - [x] `onp_nodes_total{pool, state}` (gauge) — scrape-time Collector
+  - [x] `onp_scale_up_latency_seconds` (histogram) — BootStartTime→Ready
+  - [x] `onp_power_on_total{provider, result}` (counter)
+  - [x] `onp_drain_failure_total{reason}` (counter) — drain_timeout / shutdown_timeout
+  - [x] `onp_pending_unschedulable` (gauge) — scrape-time Collector
+- [x] Kubernetes Events 발행 (Machine / NodePool / 관련 Pod) — NodePool `Membership` 이벤트 추가, Machine/Pod 는 기존
+- [x] Status Conditions 표준화 (`PowerOnSucceeded`, `DrainSucceeded`, `Ready`) — `setCondition` 표준 패턴
+- [x] `charts/onp/` Helm 차트 마무리 — PSA(옵션 namespace 템플릿)·lease RBAC·values 정리·신규 플래그·버전 0.5.0
+- [x] README: 설치 가이드, 샘플 `NodePool` / `Machine` YAML, 운영 폴리시 표, 메트릭, 트러블슈팅
+- [x] **검증 (E2E #3)** — 실하드웨어 전수 통과 (2026-06-06, 차트 0.5.0 배포, microk8s desktop/desktop1). 12개 Phase + auto-uncordon: 설치/CRD, leader election, 메트릭 5종, 실 WoL wake(×4)·scale-up latency, minNodes 하한, 실 poweroff(×3), do-not-disrupt Pod/Node, drain.force, A1 shutdown 타임아웃, A2 노드 손실, cooldown.scaleDown 모두 관측. 목적 기능(wake / scale-down / do-not-disrupt / force) 재현 절차는 `docs/e2e/`.
+  - `maxConcurrent` 직렬화는 단일 wakeable 노드라 미관측(단위 테스트 `TestScaleDownDefersAtMaxConcurrent` 커버).
+  - **발견**: (1) Helm 은 `helm upgrade` 시 `crds/` 를 갱신하지 않음 → 업그레이드 후 `kubectl apply -f charts/onp/crds/` 필요. (2) 관리 노드는 NodePool `template.labels` 를 실제로 carry 해야 wake 후 스케줄됨 → C3 에서 ONP 가 Ready 시 자동 적용으로 해소. 둘 다 README 트러블슈팅 반영.
+
+---
+
+### M5.6 — Phase 1 정합성 패스 (DESIGN ↔ 코드 ↔ CLAUDE 불변식)
+
+**왜**: M5 완료 후 디자인 doc·CLAUDE.md 의 안전/확장 불변식 대비 전수 점검에서 7개 갭(C1~C7)을 확정. 모두 additive 또는 동작 강화이고 인터페이스/CRD 스키마는 안 깨짐. 단위 테스트 동반(155 통과), E2E 재검증은 다음 클린 클러스터 배포 시.
+
+- [x] **C1** — operator cordon 흡수 방지: ONP 가 자기 cordon 에 `onp.io/cordoned-by-onp` 마커를 달고, wake/timeout uncordon 시 **마커가 있는 노드만** 해제 (운영자 수동 cordon 보존).
+- [x] **C2** — stale `onp.io/drain-now` 정리: `Off`/`Booting`/`Draining` 진입 시 잔존 drain-now 어노테이션 제거 (재기상 후 즉시 재drain 방지).
+- [x] **C3** — Ready 시 `NodePool.template.labels`(Machine `spec.labels` 우선) + `template.taints` 를 Node 에 적용 + `spec.capacity` vs `Node.status.capacity` drift 경고 Event(`CapacityDrift`).
+- [x] **C4** — 한 Machine 이 복수 NodePool 에 매칭되는 충돌 감지: scale-down 보류 + `PoolConflict` Warning Event (DESIGN 3.2 의 "충돌을 감지해 Event 로 알리고 reconcile 보류" 실현).
+- [x] **C5** — wol-agent 인증: 컨트롤러↔agent 공유 bearer token(constant-time 비교, `MaxBytesReader`), Helm 토큰 Secret 자동 생성·persist, controller split-brain 가드. (hostNetwork 라 NetworkPolicy 불가 → 토큰이 실질 방어.)
+- [x] **C6** — shutdown-agent 가 `spec.shutdown.provider` 존중: non-agent provider 선택 시 agent 가 전원 안 끔 (Phase 2 hard-cut 경로와 충돌 방지).
+- [x] **C7** — `PowerProvider.PowerStatus` 반환을 `(power.State, error)` 로 안정화 (DESIGN 3.4 인터페이스와 일치, IPMI/Redfish 확장 대비).
 
 ---
 

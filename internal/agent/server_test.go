@@ -86,7 +86,7 @@ func TestHandlerWake(t *testing.T) {
 				return tt.wakeErr
 			})
 
-			srv := httptest.NewServer(Handler(waker, nil))
+			srv := httptest.NewServer(Handler(waker, nil, ""))
 			defer srv.Close()
 
 			req, err := http.NewRequest(tt.method, srv.URL+"/wake", strings.NewReader(tt.body))
@@ -118,11 +118,130 @@ func TestHandlerWake(t *testing.T) {
 	}
 }
 
+// TestHandlerAuth locks the shared-token contract: with a token configured,
+// /wake demands a matching Bearer header (401 otherwise) while the health
+// endpoints stay open for the kubelet's probes.
+func TestHandlerAuth(t *testing.T) {
+	t.Parallel()
+
+	const token = "test-token-123"
+	validBody := `{"macAddress":"01:23:45:67:89:ab"}`
+
+	tests := []struct {
+		name       string
+		auth       string // Authorization header; empty means absent
+		wantStatus int
+		wantCalled bool
+	}{
+		{
+			name:       "matching token is accepted",
+			auth:       "Bearer " + token,
+			wantStatus: http.StatusNoContent,
+			wantCalled: true,
+		},
+		{
+			name:       "wrong token is 401",
+			auth:       "Bearer wrong-token",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "missing header is 401",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "bare token without Bearer scheme is 401",
+			auth:       token,
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			called := false
+			waker := WakerFunc(func(net.HardwareAddr, string) error {
+				called = true
+				return nil
+			})
+			srv := httptest.NewServer(Handler(waker, nil, token))
+			defer srv.Close()
+
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/wake", strings.NewReader(validBody))
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			if tt.auth != "" {
+				req.Header.Set("Authorization", tt.auth)
+			}
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if called != tt.wantCalled {
+				t.Errorf("waker called = %v, want %v", called, tt.wantCalled)
+			}
+		})
+	}
+
+	// Health endpoints must not require the token: the kubelet's probes carry
+	// no Authorization header.
+	t.Run("health endpoints skip auth", func(t *testing.T) {
+		t.Parallel()
+
+		srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error { return nil }), nil, token))
+		defer srv.Close()
+
+		for _, path := range []string{"/healthz", "/readyz"} {
+			resp, err := srv.Client().Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("get %s: %v", path, err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want %d", path, resp.StatusCode, http.StatusOK)
+			}
+		}
+	})
+}
+
+// TestHandlerBodyLimit checks an oversized /wake body is rejected with 413
+// instead of being read to completion.
+func TestHandlerBodyLimit(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error {
+		called = true
+		return nil
+	}), nil, ""))
+	defer srv.Close()
+
+	huge := `{"macAddress":"` + strings.Repeat("a", maxBodyBytes) + `"}`
+	resp, err := srv.Client().Post(srv.URL+"/wake", "application/json", strings.NewReader(huge))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if called {
+		t.Error("waker called for oversized body")
+	}
+}
+
 // TestHandlerAllowHeader checks the 405 path advertises POST, per RFC 7231.
 func TestHandlerAllowHeader(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error { return nil }), nil))
+	srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error { return nil }), nil, ""))
 	defer srv.Close()
 
 	resp, err := srv.Client().Get(srv.URL + "/wake")
@@ -141,7 +260,7 @@ func TestHandlerAllowHeader(t *testing.T) {
 func TestHandlerHealth(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error { return nil }), nil))
+	srv := httptest.NewServer(Handler(WakerFunc(func(net.HardwareAddr, string) error { return nil }), nil, ""))
 	defer srv.Close()
 
 	for _, path := range []string{"/healthz", "/readyz"} {

@@ -82,7 +82,7 @@ func newScaleDownReconciler(t *testing.T, rec record.EventRecorder, clk *clockte
 	scheme := newScheme(t)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&v1alpha1.Machine{}).
+		WithStatusSubresource(&v1alpha1.Machine{}, &v1alpha1.NodePool{}).
 		WithIndex(&corev1.Pod{}, IndexPodNodeName, func(o client.Object) []string {
 			pod, ok := o.(*corev1.Pod)
 			if !ok || pod.Spec.NodeName == "" {
@@ -270,6 +270,32 @@ func TestScaleDownDisabledWithoutConsolidateAfter(t *testing.T) {
 	}
 }
 
+// TestScaleDownHoldsOnPoolConflict: a Machine matching more than one NodePool has
+// ambiguous disruption policy, so automatic scale-down is held (no drain), a stale
+// empty timer is cleared, and a PoolConflict warning is emitted — even when the
+// node has been empty long past every pool's window.
+func TestScaleDownHoldsOnPoolConflict(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase.Add(-time.Hour) // long past the window
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool1 := whenEmptyPool("edge", &after)
+	pool2 := whenEmptyPool("edge-overlap", &after) // also selects sdLabels -> conflict
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase)
+	rec := record.NewFakeRecorder(8)
+	r, cl := newScaleDownReconciler(t, rec, clk, m, pool1, pool2)
+
+	reconcileSD(t, r, "node-a")
+
+	got := getSDMachine(t, cl, "node-a")
+	if drainNowSet(got) {
+		t.Fatal("drain-now set under pool conflict; automatic scale-down must be held")
+	}
+	if got.Status.EmptySince != nil {
+		t.Fatalf("emptySince = %v, want cleared on conflict", got.Status.EmptySince)
+	}
+	assertEvent(t, rec, reasonPoolConflict)
+}
+
 // TestScaleDownIgnoresNonReadyMachine: a non-Ready Machine is not a candidate; a
 // stale timer is cleared and nothing drains.
 func TestScaleDownIgnoresNonReadyMachine(t *testing.T) {
@@ -324,6 +350,161 @@ func TestScaleDownNoPoolDisabled(t *testing.T) {
 
 	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
 		t.Fatal("emptySince stamped for a machine in no pool")
+	}
+}
+
+// TestScaleDownRefusesBelowMinNodes: a single empty member in a pool with
+// minNodes=1 is the floor — draining it would breach the floor, so it is held.
+func TestScaleDownRefusesBelowMinNodes(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.MinNodes = 1
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	rec := record.NewFakeRecorder(8)
+	r, cl := newScaleDownReconciler(t, rec, clk, m, pool)
+
+	res := reconcileSD(t, r, "node-a")
+
+	if res.RequeueAfter != scaleDownBlockedRequeue {
+		t.Fatalf("RequeueAfter = %s, want %s (blocked by minNodes)", res.RequeueAfter, scaleDownBlockedRequeue)
+	}
+	if drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("drain-now set despite minNodes floor")
+	}
+	assertEvent(t, rec, reasonScaleDownBlocked)
+}
+
+// TestScaleDownAllowedAboveMinNodes: with a second member keeping the pool above
+// its floor, the empty node drains.
+func TestScaleDownAllowedAboveMinNodes(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	keep := sdMachine("node-b", v1alpha1.MachineStateReady, nil)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.MinNodes = 1
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, keep, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if !drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("drain-now not set; pool was above its minNodes floor")
+	}
+}
+
+// TestScaleDownDefersAtMaxConcurrent: a member already Draining occupies the
+// single concurrency slot, so a second empty node defers rather than draining too.
+func TestScaleDownDefersAtMaxConcurrent(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	draining := sdMachine("node-b", v1alpha1.MachineStateDraining, nil)
+	pool := whenEmptyPool("edge", &after)
+	one := int32(1)
+	pool.Spec.Disruption.MaxConcurrent = &one
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	rec := record.NewFakeRecorder(8)
+	r, cl := newScaleDownReconciler(t, rec, clk, m, draining, pool)
+
+	res := reconcileSD(t, r, "node-a")
+
+	if res.RequeueAfter != scaleDownBlockedRequeue {
+		t.Fatalf("RequeueAfter = %s, want %s (maxConcurrent reached)", res.RequeueAfter, scaleDownBlockedRequeue)
+	}
+	if drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("drain-now set despite maxConcurrent cap")
+	}
+	assertEvent(t, rec, reasonScaleDownBlocked)
+}
+
+// TestScaleDownDefersDuringCooldown: a recent scale-down keeps the pool in its
+// cooldown.scaleDown window; the next empty node waits exactly until it lifts.
+func TestScaleDownDefersDuringCooldown(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.Cooldown.ScaleDown = &metav1.Duration{Duration: 10 * time.Minute}
+	last := metav1.NewTime(scaleDownBase.Add(after))
+	pool.Status.LastScaleDownTime = &last
+	// 4m past the last scale-down: 6m of the 10m cooldown remains.
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after).Add(4 * time.Minute))
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, pool)
+
+	res := reconcileSD(t, r, "node-a")
+
+	if want := 6 * time.Minute; res.RequeueAfter != want {
+		t.Fatalf("RequeueAfter = %s, want %s (scale-down cooldown)", res.RequeueAfter, want)
+	}
+	if drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("drain-now set during scale-down cooldown")
+	}
+}
+
+// TestScaleDownStampsCooldownOnTrigger: the first scale-down (no prior cooldown)
+// fires and records LastScaleDownTime so the next one is rate-limited.
+func TestScaleDownStampsCooldownOnTrigger(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.Cooldown.ScaleDown = &metav1.Duration{Duration: 10 * time.Minute}
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if !drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("drain-now not set; no prior cooldown should block the first scale-down")
+	}
+	var got v1alpha1.NodePool
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "edge"}, &got); err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if got.Status.LastScaleDownTime == nil {
+		t.Fatal("LastScaleDownTime not stamped on scale-down trigger")
+	}
+}
+
+// TestScaleDownSkipsDoNotDisruptNode: a Node marked do-not-disrupt is exempt from
+// automatic scale-down — its empty timer never starts.
+func TestScaleDownSkipsDoNotDisruptNode(t *testing.T) {
+	after := 5 * time.Minute
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:        "node-a",
+		Annotations: map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue},
+	}}
+	pool := whenEmptyPool("edge", &after)
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase)
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, node, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
+		t.Fatal("emptySince stamped for a do-not-disrupt node; scale-down must skip it")
+	}
+}
+
+// TestScaleDownTreatsDoNotDisruptPodAsWorkload: a do-not-disrupt pod keeps its node
+// non-empty, so the node is never auto-targeted — no special case beyond counting
+// the pod as workload.
+func TestScaleDownTreatsDoNotDisruptPodAsWorkload(t *testing.T) {
+	after := 5 * time.Minute
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	pod := sdPod("protected", "node-a", "")
+	pod.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	pool := whenEmptyPool("edge", &after)
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase)
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, pod, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
+		t.Fatal("emptySince stamped despite a do-not-disrupt workload pod; node is not empty")
 	}
 }
 
