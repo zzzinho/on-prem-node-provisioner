@@ -115,9 +115,24 @@ func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, r.clearEmptySince(ctx, &m)
 	}
 
-	pool, err := poolForMachine(ctx, r.Client, &m)
+	// A Machine matching more than one pool has ambiguous disruption policy — whose
+	// consolidateAfter, whose minNodes/maxConcurrent? Rather than act on a guessed
+	// pool, hold automatic scale-down and warn until an operator resolves the
+	// overlap (DESIGN.md 3.2). Clear any stale empty anchor so a resolved overlap
+	// starts a fresh timer.
+	pools, err := matchingPools(ctx, r.Client, &m)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if len(pools) > 1 {
+		r.Recorder.Eventf(&m, corev1.EventTypeWarning, reasonPoolConflict,
+			"Machine %q matches %d NodePools (%s); holding automatic scale-down until the overlap is resolved",
+			m.Name, len(pools), poolNames(pools))
+		return ctrl.Result{}, r.clearEmptySince(ctx, &m)
+	}
+	var pool *v1alpha1.NodePool
+	if len(pools) == 1 {
+		pool = &pools[0]
 	}
 	after, enabled := consolidateAfter(pool)
 	if !enabled {

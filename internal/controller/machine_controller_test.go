@@ -3,12 +3,14 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,8 +46,8 @@ func (p *fakeProvider) PowerOff(context.Context, *v1alpha1.Machine) error {
 	return power.ErrUnsupported
 }
 
-func (p *fakeProvider) PowerStatus(context.Context, *v1alpha1.Machine) (v1alpha1.MachineState, error) {
-	return "", power.ErrUnsupported
+func (p *fakeProvider) PowerStatus(context.Context, *v1alpha1.Machine) (power.State, error) {
+	return power.StateUnknown, power.ErrUnsupported
 }
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -818,4 +820,230 @@ func TestReconcileUnsetStateInitializesToOff(t *testing.T) {
 	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateOff {
 		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateOff)
 	}
+}
+
+// events drains the fixture recorder's buffered Events channel without blocking.
+func (f *reconcilerFixture) events(t *testing.T) []string {
+	t.Helper()
+	rec, ok := f.r.Recorder.(*record.FakeRecorder)
+	if !ok {
+		t.Fatalf("recorder is %T, want *record.FakeRecorder", f.r.Recorder)
+	}
+	var got []string
+	for {
+		select {
+		case e := <-rec.Events:
+			got = append(got, e)
+		default:
+			return got
+		}
+	}
+}
+
+// TestReconcileDrainingDoesNotClaimOperatorCordon: when ONP drains a node the
+// operator had already cordoned (unschedulable, no onp marker), ONP must not stamp
+// the marker — otherwise a later wake would auto-uncordon a cordon ONP never placed.
+func TestReconcileDrainingDoesNotClaimOperatorCordon(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	node := readyNode("node-a")
+	node.Spec.Unschedulable = true // operator-cordoned: no onp marker
+
+	f := newFixture(t, m, node, normalPod("app-1", "node-a"))
+
+	f.reconcile(t)
+
+	n := f.getNode(t, "node-a")
+	if !n.Spec.Unschedulable {
+		t.Error("operator cordon was lifted, want left in place")
+	}
+	if _, ok := n.Annotations[v1alpha1.AnnotationCordonedByONP]; ok {
+		t.Error("ONP stamped its marker on an operator's cordon, want left unclaimed")
+	}
+	// The drain still proceeds — the pod is evicted regardless of who cordoned.
+	if len(f.evicted) != 1 || f.evicted[0] != "app-1" {
+		t.Errorf("evicted = %v, want [app-1]", f.evicted)
+	}
+}
+
+// TestReconcileDrainingTimeoutLeavesOperatorCordon: on the drain-timeout Failed
+// path, ONP uncordons only its own cordon — an operator's pre-existing cordon
+// stays in place.
+func TestReconcileDrainingTimeoutLeavesOperatorCordon(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	m.Labels = map[string]string{"pool": "a"}
+	node := readyNode("node-a")
+	node.Spec.Unschedulable = true // operator-cordoned: no onp marker
+
+	f := newFixture(t, m, node,
+		nodePool("pool-a", map[string]string{"pool": "a"}, ptrInt32(60)),
+		doNotDisruptPod("protected-1", "node-a"))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.DrainStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed DrainStartTime: %v", err)
+	}
+	f.clock.Step(61 * time.Second)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateFailed {
+		t.Fatalf("state = %q, want Failed", got.Status.State)
+	}
+	if n := f.getNode(t, "node-a"); !n.Spec.Unschedulable {
+		t.Error("operator cordon lifted on timeout, want preserved (only ONP's own cordon is lifted)")
+	}
+}
+
+// TestReconcileOffTidiesStaleDrainNow: a drain-now left on an Off Machine (set by
+// hand, or surviving a failed cleanup) is removed, so it cannot re-drain the node
+// the moment it is next woken.
+func TestReconcileOffTidiesStaleDrainNow(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, machine(v1alpha1.MachineStateOff, map[string]string{
+		v1alpha1.AnnotationDrainNow: v1alpha1.AnnotationDrainNowValue,
+	}))
+
+	f.reconcile(t)
+
+	m := f.getMachine(t)
+	if _, ok := m.Annotations[v1alpha1.AnnotationDrainNow]; ok {
+		t.Error("stale drain-now still present on Off Machine, want tidied")
+	}
+	if m.Status.State != v1alpha1.MachineStateOff {
+		t.Errorf("state = %q, want Off (no wake requested)", m.Status.State)
+	}
+}
+
+// TestReconcileDrainingTidiesLeftoverDrainNow: if startDraining's cleanup patch
+// failed, a drain-now can survive into Draining; reconcileDraining clears it so it
+// does not re-drain the node after a later wake.
+func TestReconcileDrainingTidiesLeftoverDrainNow(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, map[string]string{
+		v1alpha1.AnnotationDrainNow: v1alpha1.AnnotationDrainNowValue,
+	})
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	f := newFixture(t, m, readyNode("node-a"))
+
+	f.reconcile(t)
+
+	if _, ok := f.getMachine(t).Annotations[v1alpha1.AnnotationDrainNow]; ok {
+		t.Error("leftover drain-now still present in Draining, want tidied")
+	}
+}
+
+// TestReconcileBootingAppliesNodeTemplate: on the Ready transition ONP merges the
+// pool Template labels (overlaid by the Machine's own labels) and Template taints
+// onto the real Node, so it carries what the fit simulation assumed.
+func TestReconcileBootingAppliesNodeTemplate(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	m.Labels = map[string]string{"pool": "a"}        // selects the pool
+	m.Spec.Labels = map[string]string{"disk": "ssd"} // node-specific, wins on conflict
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	pool := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
+	pool.Spec.Template.Labels = map[string]string{"onp.io/pool": "a", "disk": "hdd"}
+	pool.Spec.Template.Taints = []corev1.Taint{{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}}
+
+	f := newFixture(t, m, readyNode("node-a"), pool)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateReady {
+		t.Fatalf("state = %q, want Ready", got.Status.State)
+	}
+	n := f.getNode(t, "node-a")
+	if n.Labels["onp.io/pool"] != "a" {
+		t.Errorf("node label onp.io/pool = %q, want a (from pool template)", n.Labels["onp.io/pool"])
+	}
+	if n.Labels["disk"] != "ssd" {
+		t.Errorf("node label disk = %q, want ssd (machine label overrides template)", n.Labels["disk"])
+	}
+	if !hasTaint(n.Spec.Taints, corev1.Taint{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}) {
+		t.Errorf("node taints = %v, want template taint applied", n.Spec.Taints)
+	}
+}
+
+// TestReconcileBootingWarnsOnCapacityDrift: when the now-Ready Node reports a
+// capacity that differs from spec.capacity, ONP becomes Ready and emits a
+// CapacityDrift warning (it does not auto-correct).
+func TestReconcileBootingWarnsOnCapacityDrift(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	m.Spec.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("8")}
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	node := readyNode("node-a")
+	node.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateReady {
+		t.Fatalf("state = %q, want Ready", got.Status.State)
+	}
+	if !hasEvent(f.events(t), reasonCapacityDrift) {
+		t.Errorf("no %s event emitted, want one for the cpu mismatch", reasonCapacityDrift)
+	}
+}
+
+// TestReconcileBootingNoCapacityDriftWhenMatching: matching capacity emits no
+// drift warning.
+func TestReconcileBootingNoCapacityDriftWhenMatching(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	m.Spec.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	node := readyNode("node-a")
+	node.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	if hasEvent(f.events(t), reasonCapacityDrift) {
+		t.Error("CapacityDrift event emitted, want none (capacity matches)")
+	}
+}
+
+// hasEvent reports whether any event string contains reason.
+func hasEvent(events []string, reason string) bool {
+	for _, e := range events {
+		if strings.Contains(e, reason) {
+			return true
+		}
+	}
+	return false
+}
+
+// resourceQty parses a resource.Quantity for tests, failing the build only if the
+// literal is malformed (it never is at call sites).
+func resourceQty(s string) resource.Quantity {
+	return resource.MustParse(s)
 }

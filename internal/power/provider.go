@@ -21,6 +21,24 @@ import (
 // returning ErrUnsupported is the honest fallback if they do not.
 var ErrUnsupported = errors.New("power: operation not supported by provider")
 
+// State is a provider's view of a node's raw power level — what a BMC or chassis
+// can report — deliberately distinct from v1alpha1.MachineState, the controller's
+// lifecycle (Booting/Ready/Draining/...). A power provider knows only whether the
+// board has power, not where the node is in its Kubernetes lifecycle; returning
+// the lifecycle enum here would force every future provider (IPMI, Redfish) into a
+// dishonest mapping. The controller interprets State into a MachineState itself.
+type State string
+
+const (
+	// StateOn means the provider observed the node powered on.
+	StateOn State = "On"
+	// StateOff means the provider observed the node powered off.
+	StateOff State = "Off"
+	// StateUnknown means the provider cannot determine the power level — the
+	// honest answer for a provider whose Capabilities.CanQueryStatus is false.
+	StateUnknown State = "Unknown"
+)
+
 // Capabilities declares, statically, which operations a provider can perform.
 // Callers branch on these rather than assuming every method works: WoL can only
 // power on, so its CanPowerOff/CanQueryStatus are false. The set is static by
@@ -44,8 +62,10 @@ type PowerProvider interface {
 	// PowerOff issues a hard power-off. Phase 1 powers nodes off via the
 	// shutdown-agent instead, so this exists for future hard-cut providers.
 	PowerOff(ctx context.Context, m *v1alpha1.Machine) error
-	// PowerStatus reports the provider's view of the node's power state.
-	PowerStatus(ctx context.Context, m *v1alpha1.Machine) (v1alpha1.MachineState, error)
+	// PowerStatus reports the provider's view of the node's raw power level (On/
+	// Off/Unknown), not its Kubernetes lifecycle. A provider that cannot query
+	// returns StateUnknown and ErrUnsupported.
+	PowerStatus(ctx context.Context, m *v1alpha1.Machine) (State, error)
 	// Capabilities reports which of the above this provider actually supports.
 	Capabilities() Capabilities
 }

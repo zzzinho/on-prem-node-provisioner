@@ -47,6 +47,6 @@ func (p *wolProvider) PowerOff(ctx context.Context, m *v1alpha1.Machine) error {
 	return ErrUnsupported
 }
 
-func (p *wolProvider) PowerStatus(ctx context.Context, m *v1alpha1.Machine) (v1alpha1.MachineState, error) {
-	return "", ErrUnsupported
+func (p *wolProvider) PowerStatus(ctx context.Context, m *v1alpha1.Machine) (State, error) {
+	return StateUnknown, ErrUnsupported
 }

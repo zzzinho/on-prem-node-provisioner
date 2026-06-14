@@ -62,6 +62,11 @@ type WoLConfig struct {
 	BroadcastAddress string `json:"broadcastAddress,omitempty"`
 }
 
+// ShutdownProviderAgent is the only Phase 1 shutdown provider: the
+// onp-shutdown-agent DaemonSet runs systemctl poweroff on the node. A hard-cut
+// power provider is a Phase 2 enum extension, not a schema break.
+const ShutdownProviderAgent = "agent"
+
 // ShutdownSpec selects how a node is powered off. The provider field exists so
 // the union can grow (e.g. a hard-cut power provider) without a schema break.
 type ShutdownSpec struct {

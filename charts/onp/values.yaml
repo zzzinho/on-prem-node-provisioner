@@ -1,11 +1,13 @@
-# Image coordinates. Both images live in the same self-hosted registry under a
-# common repository prefix: <registry>/<repository>/<component>:<tag>.
-# Anonymous pull is enabled on the registry, so no imagePullSecrets are needed.
+# Image coordinates. All three images share one prefix:
+# <registry>/<repository>/<component>:<tag>. The default points at the
+# project's GitHub Container Registry (ghcr.io/zzzinho). If you build the
+# images yourself and push to your own registry, override both fields, e.g.
+#   --set image.registry=<your-registry> --set image.repository=<your-prefix>
+# (or a local -f values file), and add imagePullSecrets to the pod specs if
+# that registry requires authenticated pulls.
 image:
-  # Defaults to GitHub Container Registry. Override for your own registry, e.g.
-  #   --set image.registry=<your-registry>   (or a local -f values file).
   registry: ghcr.io
-  repository: onp
+  repository: zzzinho
   # tag empty -> falls back to .Chart.AppVersion (see _helpers.tpl onp.image).
   tag: ""
   pullPolicy: IfNotPresent
@@ -40,6 +42,16 @@ wolAgent:
   # Port the Service exposes and the controller dials.
   port: 9119
   logLevel: info
+  # Shared bearer-token auth on /wake. The agent runs hostNetwork, so
+  # NetworkPolicy CANNOT shield it; without this token any in-cluster pod (and
+  # any host on the same L2 segment) could wake arbitrary MACs. Leave enabled.
+  auth:
+    enabled: true
+    # Name of an existing Secret holding the token under the key "token". When
+    # empty, the chart manages its own Secret: on install it generates a random
+    # token, and on upgrade it reuses the one already in the cluster (lookup),
+    # so upgrades never rotate the token mid-rollout.
+    existingSecret: ""
   resources:
     requests:
       cpu: 10m

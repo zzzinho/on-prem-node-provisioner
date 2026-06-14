@@ -26,19 +26,33 @@ const errBodyLimit = 512
 type Client struct {
 	baseURL string
 	http    *http.Client
+	token   string
+}
+
+// ClientOption configures optional Client behavior at construction.
+type ClientOption func(*Client)
+
+// WithToken makes every request carry "Authorization: Bearer <token>",
+// matching the agent's shared-token auth. An empty token is a no-op.
+func WithToken(token string) ClientOption {
+	return func(c *Client) { c.token = token }
 }
 
 // NewClient returns a Client targeting baseURL (e.g. "http://10.0.0.1:9119").
 // A nil httpClient gets a default with a bounded timeout; pass your own to
 // share a transport or tune dialing.
-func NewClient(baseURL string, httpClient *http.Client) *Client {
+func NewClient(baseURL string, httpClient *http.Client, opts ...ClientOption) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultTimeout}
 	}
-	return &Client{
+	c := &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    httpClient,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Wake asks the agent to broadcast a magic packet for macAddress. An empty
@@ -61,6 +75,9 @@ func (c *Client) Wake(ctx context.Context, macAddress, broadcastAddress string) 
 		return fmt.Errorf("wol: build wake request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

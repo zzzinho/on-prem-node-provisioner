@@ -46,6 +46,14 @@ spec:
         args:
         - --listen-addr={{ .Values.wolAgent.listenAddr }}
         - --log-level={{ .Values.wolAgent.logLevel }}
+        {{- if .Values.wolAgent.auth.enabled }}
+        env:
+        - name: ONP_WOL_AGENT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "onp.wolTokenSecretName" . }}
+              key: token
+        {{- end }}
         ports:
         - name: wake
           containerPort: {{ .Values.wolAgent.port }}

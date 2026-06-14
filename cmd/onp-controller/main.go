@@ -96,8 +96,16 @@ func main() {
 
 	// Register the power providers this controller knows about. Phase 1 ships
 	// WoL only; a new provider is one Register call, no reconciler change.
+	//
+	// ONP_WOL_AGENT_TOKEN (an env var, so the secret stays out of args) is the
+	// shared bearer token the wol-agent demands on /wake; empty means the agent
+	// runs unauthenticated and the client sends no Authorization header.
+	var wolOpts []wol.ClientOption
+	if token := os.Getenv("ONP_WOL_AGENT_TOKEN"); token != "" {
+		wolOpts = append(wolOpts, wol.WithToken(token))
+	}
 	registry := power.NewRegistry()
-	wolProvider := power.NewWoLProvider(wol.NewClient(wolAgentEndpoint, nil))
+	wolProvider := power.NewWoLProvider(wol.NewClient(wolAgentEndpoint, nil, wolOpts...))
 	if err := registry.Register(wolProvider); err != nil {
 		log.Error(err, "unable to register power provider", "provider", wolProvider.Name())
 		os.Exit(1)

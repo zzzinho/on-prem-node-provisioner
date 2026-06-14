@@ -270,6 +270,32 @@ func TestScaleDownDisabledWithoutConsolidateAfter(t *testing.T) {
 	}
 }
 
+// TestScaleDownHoldsOnPoolConflict: a Machine matching more than one NodePool has
+// ambiguous disruption policy, so automatic scale-down is held (no drain), a stale
+// empty timer is cleared, and a PoolConflict warning is emitted — even when the
+// node has been empty long past every pool's window.
+func TestScaleDownHoldsOnPoolConflict(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase.Add(-time.Hour) // long past the window
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool1 := whenEmptyPool("edge", &after)
+	pool2 := whenEmptyPool("edge-overlap", &after) // also selects sdLabels -> conflict
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase)
+	rec := record.NewFakeRecorder(8)
+	r, cl := newScaleDownReconciler(t, rec, clk, m, pool1, pool2)
+
+	reconcileSD(t, r, "node-a")
+
+	got := getSDMachine(t, cl, "node-a")
+	if drainNowSet(got) {
+		t.Fatal("drain-now set under pool conflict; automatic scale-down must be held")
+	}
+	if got.Status.EmptySince != nil {
+		t.Fatalf("emptySince = %v, want cleared on conflict", got.Status.EmptySince)
+	}
+	assertEvent(t, rec, reasonPoolConflict)
+}
+
 // TestScaleDownIgnoresNonReadyMachine: a non-Ready Machine is not a candidate; a
 // stale timer is cleared and nothing drains.
 func TestScaleDownIgnoresNonReadyMachine(t *testing.T) {

@@ -4,8 +4,8 @@ description: |-
   On-Prem Node Provisioner — a Kubernetes controller that wakes idle physical
   nodes via Wake-on-LAN when pods are pending and powers them off when empty.
 type: application
-version: 0.5.0
-appVersion: "0.5.0"
+version: 0.6.0
+appVersion: "0.6.0"
 keywords:
   - wake-on-lan
   - power-management
