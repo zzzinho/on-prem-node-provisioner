@@ -1,3 +1,11 @@
+{{- /*
+Multiple replicas without leader election means multiple ACTIVE controllers
+racing on physical power control (duplicate wakes, conflicting drains —
+split-brain on real hardware). Refuse to render rather than deploy that.
+*/}}
+{{- if and (gt (int .Values.controller.replicas) 1) (not .Values.controller.leaderElect) }}
+{{- fail "controller.replicas > 1 requires controller.leaderElect=true: without leader election every replica actively drives power state (split-brain on physical hardware)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,6 +56,14 @@ spec:
         - --leader-elect={{ .Values.controller.leaderElect }}
         - --health-probe-bind-address=:8081
         - --metrics-bind-address=:8080
+        {{- if .Values.wolAgent.auth.enabled }}
+        env:
+        - name: ONP_WOL_AGENT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "onp.wolTokenSecretName" . }}
+              key: token
+        {{- end }}
         ports:
         - name: metrics
           containerPort: 8080

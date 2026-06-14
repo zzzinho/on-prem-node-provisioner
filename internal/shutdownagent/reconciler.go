@@ -81,6 +81,16 @@ func (r *ShutdownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// Phase 1 powers nodes off through this agent. If a Machine selects a different
+	// shutdown provider — a future hard-cut path that powers the node off out of
+	// band — this agent must not also halt the host, or the node would be cut
+	// twice. A nil or empty provider is the default (agent).
+	if s := m.Spec.Shutdown; s != nil && s.Provider != "" && s.Provider != v1alpha1.ShutdownProviderAgent {
+		logger.V(1).Info("machine selects a non-agent shutdown provider; not powering off here",
+			"node", r.NodeName, "provider", s.Provider)
+		return ctrl.Result{}, nil
+	}
+
 	var issued bool
 	var powerErr error
 	r.poweredOff.Do(func() {

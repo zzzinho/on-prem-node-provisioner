@@ -2,8 +2,9 @@ ONP — On-Prem Node Provisioner has been installed as release "{{ .Release.Name
 in namespace "{{ .Release.Namespace }}".
 
 Images (pulled anonymously from {{ .Values.image.registry }}):
-  controller: {{ include "onp.image" (dict "root" $ "name" .Values.controller.name) }}
-  wol-agent:  {{ include "onp.image" (dict "root" $ "name" .Values.wolAgent.name) }}
+  controller:     {{ include "onp.image" (dict "root" $ "name" .Values.controller.name) }}
+  wol-agent:      {{ include "onp.image" (dict "root" $ "name" .Values.wolAgent.name) }}
+  shutdown-agent: {{ include "onp.image" (dict "root" $ "name" .Values.shutdownAgent.name) }}
 
 1) Label your nodes so each ONP component lands where it must:
 
@@ -55,3 +56,5 @@ Notes:
 - The wol-agent runs hostNetwork on always-on nodes because Wake-on-LAN magic
   packets are L2 broadcasts and must originate on the target node's segment.
 - The wol-agent holds NO Kubernetes API permissions by design.
+- `helm upgrade` does NOT update CRDs in crds/; after upgrading the chart, apply
+  them yourself: kubectl apply -f charts/onp/crds/

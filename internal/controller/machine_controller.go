@@ -12,6 +12,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -67,6 +69,8 @@ const (
 	reasonUncordoned      = "Uncordoned"
 	reasonShutdownTimeout = "ShutdownTimeout"
 	reasonNodeLost        = "NodeLost"
+	reasonCapacityDrift   = "CapacityDrift"
+	reasonPoolConflict    = "PoolConflict"
 )
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
@@ -179,6 +183,12 @@ func (r *MachineReconciler) initialize(ctx context.Context, m *v1alpha1.Machine)
 // failure leaves the Machine in Off and requeues; only an accepted command
 // moves it to Booting, because PowerOn success is not boot success.
 func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	// Drop a stale drain-now: it is a one-shot trigger only honored in Ready, so a
+	// leftover on an Off Machine (set by hand, or surviving a failed cleanup patch)
+	// must not re-drain the node the moment it is next woken to Ready.
+	if err := r.removeDrainAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
 	if !wakeRequested(m) {
 		return ctrl.Result{}, nil
 	}
@@ -230,6 +240,12 @@ func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machin
 // reconcileBooting promotes to Ready when the Node is Ready, fails on timeout,
 // and otherwise requeues to keep polling for readiness.
 func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	// Drop a stale drain-now set while the node is on its way up; honoring it would
+	// drain the node the instant it reaches Ready. drain-now is consumed only in
+	// reconcileReady.
+	if err := r.removeDrainAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
 	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
@@ -246,6 +262,19 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// Stamp the pool Template + Machine labels/taints onto the real Node so it
+		// carries what the fit simulation assumed when it chose to wake this Machine
+		// (DESIGN.md 3.2). Without this a pod whose nodeSelector matches a Template
+		// label passes fit but never binds, looping wake -> empty -> drain -> wake.
+		if err := r.applyNodeTemplate(ctx, m); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Compare declared capacity to what the now-Ready Node reports, to warn (not
+		// auto-correct) on operator drift in the spec.capacity source of truth.
+		drift, err := r.capacityDrift(ctx, m)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		m.Status.State = v1alpha1.MachineStateReady
 		m.Status.BootStartTime = nil
 		setCondition(m, v1alpha1.ConditionReady, metav1.ConditionTrue, reasonReady, "backing Node is Ready")
@@ -256,6 +285,11 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 		if uncordoned {
 			r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonUncordoned,
 				"uncordoned Node %q on wake (it was cordoned by a prior scale-down)", m.Spec.NodeName)
+		}
+		if drift != "" {
+			r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonCapacityDrift,
+				"declared spec.capacity differs from Node %q: %s (fit uses spec.capacity; reconcile this by hand)",
+				m.Spec.NodeName, drift)
 		}
 		// Clear the trigger so a stale annotation does not re-wake the node later.
 		if err := r.removeWakeAnnotation(ctx, m); err != nil {
@@ -377,15 +411,22 @@ func (r *MachineReconciler) reconcileReadyNodeLost(ctx context.Context, m *v1alp
 // cordoned across Draining -> ShuttingDown -> Off; only the timeout path
 // uncordons.
 func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	// The drain is under way, so the one-shot trigger has done its job. Clear it
+	// defensively in case startDraining's own cleanup patch failed: a drain-now that
+	// survives to Off would re-drain the node the next time it is woken to Ready.
+	if err := r.removeDrainAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
 	timeout, force, err := r.drainPolicy(ctx, m)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Timeout first: a node that will not drain must stop before we touch any
-	// more pods, and the stop must uncordon so the operator can recover the node.
+	// more pods, and the stop must uncordon so the operator can recover the node —
+	// but only the cordon ONP itself placed, never an operator's pre-existing one.
 	if r.drainTimedOut(m, timeout) {
-		if err := r.setCordon(ctx, m.Spec.NodeName, false); err != nil {
+		if _, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName); err != nil {
 			return ctrl.Result{}, err
 		}
 		m.Status.State = v1alpha1.MachineStateFailed
@@ -576,13 +617,31 @@ func (r *MachineReconciler) drainPolicy(ctx context.Context, m *v1alpha1.Machine
 // Machine's labels, or nil when none match. It mirrors NodePoolReconciler's
 // selector logic (metav1.LabelSelectorAsSelector + a labels.Set match); the pool
 // count is assumed small, so a full list per reconcile is acceptable. The drain
-// (timeout resolution) and scale-down (disruption policy) paths share it.
+// (timeout resolution) path uses it; a Machine matching more than one pool is a
+// conflict the scale-down path surfaces and holds on (matchingPools), so first
+// match here only ever bounds an operator-triggered manual drain.
 func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (*v1alpha1.NodePool, error) {
+	pools, err := matchingPools(ctx, c, m)
+	if err != nil {
+		return nil, err
+	}
+	if len(pools) == 0 {
+		return nil, nil
+	}
+	return &pools[0], nil
+}
+
+// matchingPools returns every NodePool whose machineSelector matches the Machine's
+// labels. Label selection lets a Machine match more than one pool; callers that
+// must act on a single pool's policy treat len > 1 as a conflict rather than
+// silently picking one (DESIGN.md 3.2).
+func matchingPools(ctx context.Context, c client.Client, m *v1alpha1.Machine) ([]v1alpha1.NodePool, error) {
 	var pools v1alpha1.NodePoolList
 	if err := c.List(ctx, &pools); err != nil {
 		return nil, fmt.Errorf("list nodepools for machine %q: %w", m.Name, err)
 	}
 	machineLabels := labels.Set(m.Labels)
+	var matched []v1alpha1.NodePool
 	for i := range pools.Items {
 		selector, err := metav1.LabelSelectorAsSelector(&pools.Items[i].Spec.MachineSelector)
 		if err != nil {
@@ -590,17 +649,140 @@ func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (
 			continue
 		}
 		if selector.Matches(machineLabels) {
-			return &pools.Items[i], nil
+			matched = append(matched, pools.Items[i])
 		}
 	}
-	return nil, nil
+	return matched, nil
 }
 
-// setCordon patches the Node's spec.unschedulable to the given value and, in the
-// same patch, sets or clears the onp.io/cordoned-by-onp marker so a later wake
-// can tell ONP's cordon from an operator's. It is a no-op when the node already
-// matches both. A missing Node is not an error: the cordon target may have gone
-// away, in which case there is nothing to drain.
+// poolNames joins the pools' names in sorted order, for a stable conflict message.
+func poolNames(pools []v1alpha1.NodePool) string {
+	names := make([]string, len(pools))
+	for i := range pools {
+		names[i] = pools[i].Name
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// applyNodeTemplate merges the pool Template labels (overlaid by the Machine's own
+// Labels — Machine wins, matching nodeForMachine's fit overlay) and the pool
+// Template taints onto the backing Node as it enters service. It is a one-shot
+// additive merge on the Ready transition: it adds missing labels/taints and never
+// removes an operator's later edits, and it is a no-op when nothing is configured
+// or already present. A missing Node or pool is not an error.
+func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.Machine) error {
+	if m.Spec.NodeName == "" {
+		return nil
+	}
+	pool, err := poolForMachine(ctx, r.Client, m)
+	if err != nil {
+		return err
+	}
+	desiredLabels := map[string]string{}
+	if pool != nil {
+		for k, v := range pool.Spec.Template.Labels {
+			desiredLabels[k] = v
+		}
+	}
+	for k, v := range m.Spec.Labels {
+		desiredLabels[k] = v
+	}
+	var desiredTaints []corev1.Taint
+	if pool != nil {
+		desiredTaints = pool.Spec.Template.Taints
+	}
+	if len(desiredLabels) == 0 && len(desiredTaints) == 0 {
+		return nil
+	}
+
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: m.Spec.NodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get node %q to apply template: %w", m.Spec.NodeName, err)
+	}
+	orig := node.DeepCopy()
+	changed := false
+	for k, v := range desiredLabels {
+		if node.Labels[k] != v {
+			if node.Labels == nil {
+				node.Labels = map[string]string{}
+			}
+			node.Labels[k] = v
+			changed = true
+		}
+	}
+	for _, t := range desiredTaints {
+		if !hasTaint(node.Spec.Taints, t) {
+			node.Spec.Taints = append(node.Spec.Taints, t)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := r.Patch(ctx, &node, client.MergeFrom(orig)); err != nil {
+		return fmt.Errorf("apply template to node %q: %w", m.Spec.NodeName, err)
+	}
+	return nil
+}
+
+// hasTaint reports whether taints already contains an entry equal to t on key,
+// value and effect.
+func hasTaint(taints []corev1.Taint, t corev1.Taint) bool {
+	for i := range taints {
+		if taints[i].Key == t.Key && taints[i].Value == t.Value && taints[i].Effect == t.Effect {
+			return true
+		}
+	}
+	return false
+}
+
+// capacityDrift compares the Machine's declared spec.capacity to what its backing
+// Node reports once Ready, returning a human-readable summary of every resource
+// that differs (or "" when none do). It does not correct anything — the spec is
+// the fit source of truth by design, and a mismatch may be the operator's intent —
+// it only gives the caller a string to warn with (DESIGN.md 3.2).
+func (r *MachineReconciler) capacityDrift(ctx context.Context, m *v1alpha1.Machine) (string, error) {
+	if len(m.Spec.Capacity) == 0 || m.Spec.NodeName == "" {
+		return "", nil
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: m.Spec.NodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get node %q for capacity drift: %w", m.Spec.NodeName, err)
+	}
+	var diffs []string
+	for name, declared := range m.Spec.Capacity {
+		actual, ok := node.Status.Capacity[name]
+		if !ok {
+			diffs = append(diffs, fmt.Sprintf("%s declared %s, Node reports none", name, declared.String()))
+			continue
+		}
+		if declared.Cmp(actual) != 0 {
+			diffs = append(diffs, fmt.Sprintf("%s declared %s, Node reports %s", name, declared.String(), actual.String()))
+		}
+	}
+	sort.Strings(diffs)
+	return strings.Join(diffs, "; "), nil
+}
+
+// setCordon patches the Node's spec.unschedulable to the given value, stamping or
+// clearing the onp.io/cordoned-by-onp marker so a later wake can tell ONP's cordon
+// from an operator's. A missing Node is not an error: the cordon target may have
+// gone away, in which case there is nothing to drain.
+//
+// Cordon only claims a cordon ONP actually places. If the node is already
+// unschedulable — an operator cordoned it, or ONP did on a prior reconcile — it is
+// left untouched and the marker is not stamped: a cordon ONP did not transition
+// must never be auto-uncordoned on a later wake. The drain proceeds regardless,
+// since the node being unschedulable is all the drain needs. Uncordon clears the
+// state and drops the marker; callers gate it on the marker (uncordonIfONPCordoned)
+// so an operator's manual cordon is never lifted.
 func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) error {
 	if nodeName == "" {
 		return nil
@@ -612,23 +794,34 @@ func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unsc
 		}
 		return fmt.Errorf("get node %q to cordon: %w", nodeName, err)
 	}
-	_, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]
-	// The marker tracks the cordon: present iff ONP holds the node cordoned.
-	if node.Spec.Unschedulable == unschedulable && marked == unschedulable {
-		return nil
-	}
-	patch := client.MergeFrom(node.DeepCopy())
-	node.Spec.Unschedulable = unschedulable
+
 	if unschedulable {
+		if node.Spec.Unschedulable {
+			// Already cordoned (operator's, or ours from a prior reconcile). Do not
+			// claim it by stamping the marker.
+			return nil
+		}
+		patch := client.MergeFrom(node.DeepCopy())
+		node.Spec.Unschedulable = true
 		if node.Annotations == nil {
 			node.Annotations = map[string]string{}
 		}
 		node.Annotations[v1alpha1.AnnotationCordonedByONP] = "true"
-	} else {
-		delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
+		if err := r.Patch(ctx, &node, patch); err != nil {
+			return fmt.Errorf("cordon node %q: %w", nodeName, err)
+		}
+		return nil
 	}
+
+	_, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]
+	if !node.Spec.Unschedulable && !marked {
+		return nil
+	}
+	patch := client.MergeFrom(node.DeepCopy())
+	node.Spec.Unschedulable = false
+	delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
 	if err := r.Patch(ctx, &node, patch); err != nil {
-		return fmt.Errorf("set node %q unschedulable=%t: %w", nodeName, unschedulable, err)
+		return fmt.Errorf("uncordon node %q: %w", nodeName, err)
 	}
 	return nil
 }
