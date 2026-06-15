@@ -20,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	onpv1alpha1 "github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
@@ -46,18 +47,22 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr      string
-		probeAddr        string
-		leaderElect      bool
-		bootTimeout      time.Duration
-		wolAgentEndpoint string
-		logLevel         string
+		metricsAddr         string
+		probeAddr           string
+		leaderElect         bool
+		bootTimeout         time.Duration
+		shutdownTimeout     time.Duration
+		nodeLossGracePeriod time.Duration
+		wolAgentEndpoint    string
+		logLevel            string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election to ensure a single active controller.")
 	flag.StringVar(&logLevel, "log-level", "info", "Minimum log level: debug|info|warn|error.")
 	flag.DurationVar(&bootTimeout, "boot-timeout", 10*time.Minute, "How long to wait for a node to report Ready after power-on before failing.")
+	flag.DurationVar(&shutdownTimeout, "shutdown-timeout", 5*time.Minute, "How long to wait for a node to go NotReady after power-off before failing the Machine.")
+	flag.DurationVar(&nodeLossGracePeriod, "node-loss-grace-period", time.Minute, "How long a Ready Machine's Node may stay NotReady (with no ONP drain) before the Machine falls back to Off.")
 	flag.StringVar(&wolAgentEndpoint, "wol-agent-endpoint", "http://onp-wol-agent:9119", "Base URL of the onp-wol-agent that broadcasts magic packets.")
 	flag.Parse()
 
@@ -80,6 +85,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "onp-controller.onp.io",
+		// Release the lease on graceful shutdown so a rolling update's next replica
+		// becomes leader at once instead of waiting out the lease duration.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		log.Error(err, "unable to create manager")
@@ -88,8 +96,16 @@ func main() {
 
 	// Register the power providers this controller knows about. Phase 1 ships
 	// WoL only; a new provider is one Register call, no reconciler change.
+	//
+	// ONP_WOL_AGENT_TOKEN (an env var, so the secret stays out of args) is the
+	// shared bearer token the wol-agent demands on /wake; empty means the agent
+	// runs unauthenticated and the client sends no Authorization header.
+	var wolOpts []wol.ClientOption
+	if token := os.Getenv("ONP_WOL_AGENT_TOKEN"); token != "" {
+		wolOpts = append(wolOpts, wol.WithToken(token))
+	}
 	registry := power.NewRegistry()
-	wolProvider := power.NewWoLProvider(wol.NewClient(wolAgentEndpoint, nil))
+	wolProvider := power.NewWoLProvider(wol.NewClient(wolAgentEndpoint, nil, wolOpts...))
 	if err := registry.Register(wolProvider); err != nil {
 		log.Error(err, "unable to register power provider", "provider", wolProvider.Name())
 		os.Exit(1)
@@ -124,12 +140,14 @@ func main() {
 	}
 
 	if err := (&controller.MachineReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Registry:    registry,
-		BootTimeout: bootTimeout,
-		Recorder:    mgr.GetEventRecorderFor("onp-controller"),
-		Clock:       clock.RealClock{},
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		Registry:            registry,
+		BootTimeout:         bootTimeout,
+		ShutdownTimeout:     shutdownTimeout,
+		NodeLossGracePeriod: nodeLossGracePeriod,
+		Recorder:            mgr.GetEventRecorderFor("onp-controller"),
+		Clock:               clock.RealClock{},
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up machine reconciler")
 		os.Exit(1)
@@ -163,6 +181,11 @@ func main() {
 		log.Error(err, "unable to set up scale-down reconciler")
 		os.Exit(1)
 	}
+
+	// The current-state gauges (onp_nodes_total, onp_pending_unschedulable) are
+	// computed at scrape time from the manager's cache; the event-driven metrics
+	// register themselves in internal/metrics' init.
+	ctrlmetrics.Registry.MustRegister(controller.NewStateCollector(mgr.GetClient()))
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")

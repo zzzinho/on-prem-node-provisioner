@@ -96,6 +96,50 @@ func TestClientWake(t *testing.T) {
 	}
 }
 
+// TestClientWakeAuthorization locks the token contract: WithToken attaches a
+// Bearer header, and the default client sends no Authorization at all (so an
+// unauthenticated agent never sees a surprise header).
+func TestClientWakeAuthorization(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		opts     []ClientOption
+		wantAuth string
+	}{
+		{
+			name:     "WithToken attaches Bearer header",
+			opts:     []ClientOption{WithToken("secret-token")},
+			wantAuth: "Bearer secret-token",
+		},
+		{
+			name:     "no token sends no Authorization header",
+			wantAuth: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+
+			c := NewClient(srv.URL, srv.Client(), tt.opts...)
+			if err := c.Wake(context.Background(), "01:23:45:67:89:ab", ""); err != nil {
+				t.Fatalf("Wake() unexpected error: %v", err)
+			}
+			if gotAuth != tt.wantAuth {
+				t.Errorf("Authorization = %q, want %q", gotAuth, tt.wantAuth)
+			}
+		})
+	}
+}
+
 // TestClientWakeBaseURLTrailingSlash locks the contract that a trailing slash on
 // the base URL does not produce a double slash in the request path.
 func TestClientWakeBaseURLTrailingSlash(t *testing.T) {

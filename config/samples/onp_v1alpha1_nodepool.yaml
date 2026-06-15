@@ -22,6 +22,8 @@ spec:
   disruption:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 5m
+    # Most nodes ONP may drain at once in this pool (default 1 = serial).
+    maxConcurrent: 1
   # Rate-limit scale decisions.
   cooldown:
     scaleUp: 30s

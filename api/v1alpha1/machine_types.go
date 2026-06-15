@@ -62,6 +62,11 @@ type WoLConfig struct {
 	BroadcastAddress string `json:"broadcastAddress,omitempty"`
 }
 
+// ShutdownProviderAgent is the only Phase 1 shutdown provider: the
+// onp-shutdown-agent DaemonSet runs systemctl poweroff on the node. A hard-cut
+// power provider is a Phase 2 enum extension, not a schema break.
+const ShutdownProviderAgent = "agent"
+
 // ShutdownSpec selects how a node is powered off. The provider field exists so
 // the union can grow (e.g. a hard-cut power provider) without a schema break.
 type ShutdownSpec struct {
@@ -128,6 +133,27 @@ type MachineStatus struct {
 	// controller restarts.
 	// +optional
 	EmptySince *metav1.Time `json:"emptySince,omitempty"`
+
+	// ShutdownStartTime is when the controller moved this Machine into ShuttingDown.
+	// It is the source of truth for the shutdown-timeout check: if the backing Node
+	// has not gone NotReady within that budget, the power-off did not take effect
+	// (e.g. the agent never ran, or the board powered itself back on) and the
+	// Machine is failed rather than polling forever. It is an explicit field, not a
+	// Condition timestamp, for the same idempotency reasons as BootStartTime and
+	// DrainStartTime.
+	// +optional
+	ShutdownStartTime *metav1.Time `json:"shutdownStartTime,omitempty"`
+
+	// NotReadySince is when the controller first observed a Ready Machine's backing
+	// Node go NotReady without ONP having initiated a drain — an external power-off
+	// or node loss. It anchors a grace window: only if the Node stays NotReady for
+	// that whole window does the Machine fall back to Off (whence scale-up can wake
+	// it again), so a brief kubelet blip does not flap the Machine. It is cleared
+	// the moment the Node is Ready again. Like EmptySince it is an explicit field,
+	// not a Condition timestamp, to keep the timer independent of status churn and
+	// idempotent across controller restarts.
+	// +optional
+	NotReadySince *metav1.Time `json:"notReadySince,omitempty"`
 
 	// Conditions follow the standard Kubernetes condition pattern.
 	// +listType=map

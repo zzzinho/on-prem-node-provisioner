@@ -51,6 +51,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Name of the Secret carrying the shared wol-agent bearer token: the
+operator-provided Secret when wolAgent.auth.existingSecret is set, else the
+chart-managed one. The Secret must hold the token under the key "token".
+*/}}
+{{- define "onp.wolTokenSecretName" -}}
+{{- default (printf "%s-wol-token" (include "onp.fullname" .)) .Values.wolAgent.auth.existingSecret }}
+{{- end }}
+
+{{/*
 Resolve a full image reference for one component, defaulting the tag to the
 chart's appVersion when image.tag is empty.
 Usage: include "onp.image" (dict "root" $ "name" "onp-controller")

@@ -1,0 +1,43 @@
+{{- if .Values.controller.leaderElect }}
+# Leader election needs a Lease in the release namespace. It is a namespaced Role
+# (not part of the controller's ClusterRole) and is rendered only when leaderElect
+# is enabled, so the default single-replica install grants nothing extra. The
+# controller-runtime manager creates/renews one Lease named onp-controller.onp.io.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "onp.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "onp.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "onp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "onp.fullname" . }}-leader-election
+subjects:
+- kind: ServiceAccount
+  name: {{ include "onp.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+{{- end }}

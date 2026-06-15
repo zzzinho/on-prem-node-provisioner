@@ -26,6 +26,21 @@ import (
 // shutdownTimeout bounds graceful drain of in-flight requests on SIGTERM.
 const shutdownTimeout = 10 * time.Second
 
+// tokenEnv names the environment variable that carries the shared bearer token
+// the controller must present on /wake. An env var (not a flag) keeps the
+// secret out of `ps` output and pod spec args; the chart injects it via
+// secretKeyRef.
+const tokenEnv = "ONP_WOL_AGENT_TOKEN"
+
+// Read/write deadlines for the HTTP server. The agent runs hostNetwork on an
+// open port, so a slowloris-style peer must not be able to pin connections;
+// every legitimate exchange is a tiny JSON POST that completes immediately.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	writeTimeout      = 10 * time.Second
+)
+
 func main() {
 	var (
 		listenAddr string
@@ -42,16 +57,25 @@ func main() {
 	}
 	logger := logging.New(logging.Options{Level: lvl})
 
-	if err := run(listenAddr, logger); err != nil {
+	token := os.Getenv(tokenEnv)
+	if token == "" {
+		logger.Warn("no bearer token configured — /wake is unauthenticated, any caller that can reach this host port can trigger a wake",
+			"env", tokenEnv)
+	}
+
+	if err := run(listenAddr, token, logger); err != nil {
 		logger.Error("agent exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(listenAddr string, logger *slog.Logger) error {
+func run(listenAddr, token string, logger *slog.Logger) error {
 	srv := &http.Server{
-		Addr:    listenAddr,
-		Handler: agent.Handler(nil, logger),
+		Addr:              listenAddr,
+		Handler:           agent.Handler(nil, logger, token),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
 	}
 
 	// signal.NotifyContext cancels ctx on the first SIGINT/SIGTERM and restores

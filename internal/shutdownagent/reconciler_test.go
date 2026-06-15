@@ -140,6 +140,40 @@ func TestReconcilePowersOff(t *testing.T) {
 	}
 }
 
+// TestReconcileHonorsShutdownProvider: the agent powers off only when the Machine
+// selects the agent shutdown provider (or none, the default). A non-agent provider
+// — a future hard-cut path — must not also halt the host here.
+func TestReconcileHonorsShutdownProvider(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		provider  string // value for spec.shutdown.provider; "" leaves Shutdown nil
+		wantCalls int
+	}{
+		{name: "nil shutdown spec powers off (default agent)", provider: "", wantCalls: 1},
+		{name: "explicit agent provider powers off", provider: v1alpha1.ShutdownProviderAgent, wantCalls: 1},
+		{name: "non-agent provider does not power off", provider: "ipmi", wantCalls: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := machine("node-a", thisNode, v1alpha1.MachineStateShuttingDown)
+			if tt.provider != "" {
+				m.Spec.Shutdown = &v1alpha1.ShutdownSpec{Provider: tt.provider}
+			}
+			f := newFixture(t, nil, m)
+
+			f.reconcile(t, "node-a")
+
+			if *f.calls != tt.wantCalls {
+				t.Errorf("PowerOff calls = %d, want %d", *f.calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
 // TestReconcileIsIdempotent verifies the sync.Once guard: repeated reconciles of
 // the same ShuttingDown Machine issue exactly one power-off.
 func TestReconcileIsIdempotent(t *testing.T) {

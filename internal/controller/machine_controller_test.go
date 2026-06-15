@@ -3,12 +3,14 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,8 +46,8 @@ func (p *fakeProvider) PowerOff(context.Context, *v1alpha1.Machine) error {
 	return power.ErrUnsupported
 }
 
-func (p *fakeProvider) PowerStatus(context.Context, *v1alpha1.Machine) (v1alpha1.MachineState, error) {
-	return "", power.ErrUnsupported
+func (p *fakeProvider) PowerStatus(context.Context, *v1alpha1.Machine) (power.State, error) {
+	return power.StateUnknown, power.ErrUnsupported
 }
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -146,12 +148,14 @@ func newFixture(t *testing.T, objs ...client.Object) *reconcilerFixture {
 		clock:    fc,
 	}
 	f.r = &MachineReconciler{
-		Client:      cl,
-		Scheme:      scheme,
-		Registry:    registry,
-		BootTimeout: 10 * time.Minute,
-		Recorder:    record.NewFakeRecorder(16),
-		Clock:       fc,
+		Client:              cl,
+		Scheme:              scheme,
+		Registry:            registry,
+		BootTimeout:         10 * time.Minute,
+		ShutdownTimeout:     5 * time.Minute,
+		NodeLossGracePeriod: time.Minute,
+		Recorder:            record.NewFakeRecorder(16),
+		Clock:               fc,
 		// Stub Evict: the fake client's eviction subresource deletes the pod
 		// unconditionally and never returns the PDB-blocked TooManyRequests we
 		// must exercise, so the test drives eviction through this stub.
@@ -398,6 +402,114 @@ func TestReconcileShuttingDownNodeStillReadyKeepsPolling(t *testing.T) {
 	}
 }
 
+// TestReconcileShuttingDownTimesOutFails (A1): a node that never goes NotReady
+// after power-off must not poll forever — once the shutdown budget elapses the
+// Machine is failed.
+func TestReconcileShuttingDownTimesOutFails(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	f := newFixture(t, m, readyNode("node-a"))
+	// Stamp ShutdownStartTime at the fake clock, then advance past the timeout
+	// while the node stays Ready (the power-off never landed).
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.ShutdownStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed ShutdownStartTime: %v", err)
+	}
+	f.clock.Step(6 * time.Minute)
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateFailed {
+		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateFailed)
+	}
+	if got.Status.ShutdownStartTime != nil {
+		t.Error("ShutdownStartTime still set, want cleared on Failed")
+	}
+	cond := condition(got, v1alpha1.ConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "ShutdownTimeout" {
+		t.Errorf("Ready condition = %+v, want False/ShutdownTimeout", cond)
+	}
+}
+
+// TestReconcileReadyNodeNotReadyStampsAnchor (A2): a Ready Machine whose Node goes
+// NotReady (with no ONP drain) anchors the loss timer and waits out the grace
+// window rather than dropping to Off on a possibly-transient blip.
+func TestReconcileReadyNodeNotReadyStampsAnchor(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, machine(v1alpha1.MachineStateReady, nil), notReadyNode("node-a"))
+
+	res := f.reconcile(t)
+
+	if res.RequeueAfter != f.r.NodeLossGracePeriod {
+		t.Errorf("RequeueAfter = %v, want %v (grace window)", res.RequeueAfter, f.r.NodeLossGracePeriod)
+	}
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want Ready (within grace)", got.Status.State)
+	}
+	if got.Status.NotReadySince == nil {
+		t.Error("NotReadySince = nil, want stamped")
+	}
+}
+
+// TestReconcileReadyNodeNotReadyPastGraceBecomesOff (A2): once the Node has stayed
+// NotReady for the whole grace window the Machine falls back to Off so scale-up
+// can wake it again.
+func TestReconcileReadyNodeNotReadyPastGraceBecomesOff(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateReady, nil)
+	f := newFixture(t, m, notReadyNode("node-a"))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.NotReadySince = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed NotReadySince: %v", err)
+	}
+	f.clock.Step(61 * time.Second)
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateOff {
+		t.Errorf("state = %q, want Off (node lost past grace)", got.Status.State)
+	}
+	if got.Status.NotReadySince != nil {
+		t.Error("NotReadySince still set, want cleared on Off")
+	}
+	cond := condition(got, v1alpha1.ConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "NodeLost" {
+		t.Errorf("Ready condition = %+v, want False/NodeLost", cond)
+	}
+}
+
+// TestReconcileReadyNodeRecoversClearsAnchor (A2): a Node that recovers within the
+// grace window clears the loss anchor and the Machine stays Ready.
+func TestReconcileReadyNodeRecoversClearsAnchor(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateReady, nil)
+	f := newFixture(t, m, readyNode("node-a"))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.NotReadySince = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed NotReadySince: %v", err)
+	}
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want Ready (node recovered)", got.Status.State)
+	}
+	if got.Status.NotReadySince != nil {
+		t.Error("NotReadySince still set, want cleared on recovery")
+	}
+}
+
 // normalPod returns a plain pod scheduled on the node, evictable by a drain.
 func normalPod(name, nodeName string) *corev1.Pod {
 	return &corev1.Pod{
@@ -598,6 +710,61 @@ func TestReconcileDrainingBlockedEvictionStaysDraining(t *testing.T) {
 	}
 }
 
+// doNotDisruptPod returns a plain workload pod carrying the do-not-disrupt
+// annotation.
+func doNotDisruptPod(name, nodeName string) *corev1.Pod {
+	p := normalPod(name, nodeName)
+	p.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	return p
+}
+
+// TestReconcileDrainingSkipsDoNotDisruptPod: an unforced drain must not evict a
+// do-not-disrupt pod, and the pod keeps the node non-empty, so the Machine stays
+// Draining (it later times out into Failed) rather than powering off the node.
+func TestReconcileDrainingSkipsDoNotDisruptPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	f := newFixture(t, m, readyNode("node-a"), doNotDisruptPod("protected-1", "node-a"))
+
+	res := f.reconcile(t)
+
+	if res.RequeueAfter != drainPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v (protected pod blocks completion)", res.RequeueAfter, drainPollInterval)
+	}
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none (do-not-disrupt pod must not be evicted)", f.evicted)
+	}
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateDraining {
+		t.Errorf("state = %q, want Draining (node not empty while protected pod runs)", got.Status.State)
+	}
+}
+
+// TestReconcileDrainingForceEvictsDoNotDisruptPod: drain.force=true lifts the
+// do-not-disrupt exemption — the pod is evicted like any other workload.
+func TestReconcileDrainingForceEvictsDoNotDisruptPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	m.Labels = map[string]string{"pool": "a"}
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	pool := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
+	pool.Spec.Drain.Force = true
+
+	f := newFixture(t, m, readyNode("node-a"), pool, doNotDisruptPod("protected-1", "node-a"))
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 1 || f.evicted[0] != "protected-1" {
+		t.Errorf("evicted = %v, want [protected-1] (force evicts do-not-disrupt pods)", f.evicted)
+	}
+}
+
 func TestDrainTimeoutResolution(t *testing.T) {
 	t.Parallel()
 
@@ -627,12 +794,12 @@ func TestDrainTimeoutResolution(t *testing.T) {
 			m.Labels = tt.labels
 			f := newFixture(t, append([]client.Object{m}, tt.pools...)...)
 
-			got, err := f.r.drainTimeout(context.Background(), m)
+			got, _, err := f.r.drainPolicy(context.Background(), m)
 			if err != nil {
-				t.Fatalf("drainTimeout() error: %v", err)
+				t.Fatalf("drainPolicy() error: %v", err)
 			}
 			if got != tt.want {
-				t.Errorf("drainTimeout() = %v, want %v", got, tt.want)
+				t.Errorf("drainPolicy() timeout = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -653,4 +820,230 @@ func TestReconcileUnsetStateInitializesToOff(t *testing.T) {
 	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateOff {
 		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateOff)
 	}
+}
+
+// events drains the fixture recorder's buffered Events channel without blocking.
+func (f *reconcilerFixture) events(t *testing.T) []string {
+	t.Helper()
+	rec, ok := f.r.Recorder.(*record.FakeRecorder)
+	if !ok {
+		t.Fatalf("recorder is %T, want *record.FakeRecorder", f.r.Recorder)
+	}
+	var got []string
+	for {
+		select {
+		case e := <-rec.Events:
+			got = append(got, e)
+		default:
+			return got
+		}
+	}
+}
+
+// TestReconcileDrainingDoesNotClaimOperatorCordon: when ONP drains a node the
+// operator had already cordoned (unschedulable, no onp marker), ONP must not stamp
+// the marker — otherwise a later wake would auto-uncordon a cordon ONP never placed.
+func TestReconcileDrainingDoesNotClaimOperatorCordon(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	node := readyNode("node-a")
+	node.Spec.Unschedulable = true // operator-cordoned: no onp marker
+
+	f := newFixture(t, m, node, normalPod("app-1", "node-a"))
+
+	f.reconcile(t)
+
+	n := f.getNode(t, "node-a")
+	if !n.Spec.Unschedulable {
+		t.Error("operator cordon was lifted, want left in place")
+	}
+	if _, ok := n.Annotations[v1alpha1.AnnotationCordonedByONP]; ok {
+		t.Error("ONP stamped its marker on an operator's cordon, want left unclaimed")
+	}
+	// The drain still proceeds — the pod is evicted regardless of who cordoned.
+	if len(f.evicted) != 1 || f.evicted[0] != "app-1" {
+		t.Errorf("evicted = %v, want [app-1]", f.evicted)
+	}
+}
+
+// TestReconcileDrainingTimeoutLeavesOperatorCordon: on the drain-timeout Failed
+// path, ONP uncordons only its own cordon — an operator's pre-existing cordon
+// stays in place.
+func TestReconcileDrainingTimeoutLeavesOperatorCordon(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	m.Labels = map[string]string{"pool": "a"}
+	node := readyNode("node-a")
+	node.Spec.Unschedulable = true // operator-cordoned: no onp marker
+
+	f := newFixture(t, m, node,
+		nodePool("pool-a", map[string]string{"pool": "a"}, ptrInt32(60)),
+		doNotDisruptPod("protected-1", "node-a"))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.DrainStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed DrainStartTime: %v", err)
+	}
+	f.clock.Step(61 * time.Second)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateFailed {
+		t.Fatalf("state = %q, want Failed", got.Status.State)
+	}
+	if n := f.getNode(t, "node-a"); !n.Spec.Unschedulable {
+		t.Error("operator cordon lifted on timeout, want preserved (only ONP's own cordon is lifted)")
+	}
+}
+
+// TestReconcileOffTidiesStaleDrainNow: a drain-now left on an Off Machine (set by
+// hand, or surviving a failed cleanup) is removed, so it cannot re-drain the node
+// the moment it is next woken.
+func TestReconcileOffTidiesStaleDrainNow(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, machine(v1alpha1.MachineStateOff, map[string]string{
+		v1alpha1.AnnotationDrainNow: v1alpha1.AnnotationDrainNowValue,
+	}))
+
+	f.reconcile(t)
+
+	m := f.getMachine(t)
+	if _, ok := m.Annotations[v1alpha1.AnnotationDrainNow]; ok {
+		t.Error("stale drain-now still present on Off Machine, want tidied")
+	}
+	if m.Status.State != v1alpha1.MachineStateOff {
+		t.Errorf("state = %q, want Off (no wake requested)", m.Status.State)
+	}
+}
+
+// TestReconcileDrainingTidiesLeftoverDrainNow: if startDraining's cleanup patch
+// failed, a drain-now can survive into Draining; reconcileDraining clears it so it
+// does not re-drain the node after a later wake.
+func TestReconcileDrainingTidiesLeftoverDrainNow(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, map[string]string{
+		v1alpha1.AnnotationDrainNow: v1alpha1.AnnotationDrainNowValue,
+	})
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+
+	f := newFixture(t, m, readyNode("node-a"))
+
+	f.reconcile(t)
+
+	if _, ok := f.getMachine(t).Annotations[v1alpha1.AnnotationDrainNow]; ok {
+		t.Error("leftover drain-now still present in Draining, want tidied")
+	}
+}
+
+// TestReconcileBootingAppliesNodeTemplate: on the Ready transition ONP merges the
+// pool Template labels (overlaid by the Machine's own labels) and Template taints
+// onto the real Node, so it carries what the fit simulation assumed.
+func TestReconcileBootingAppliesNodeTemplate(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	m.Labels = map[string]string{"pool": "a"}        // selects the pool
+	m.Spec.Labels = map[string]string{"disk": "ssd"} // node-specific, wins on conflict
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	pool := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
+	pool.Spec.Template.Labels = map[string]string{"onp.io/pool": "a", "disk": "hdd"}
+	pool.Spec.Template.Taints = []corev1.Taint{{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}}
+
+	f := newFixture(t, m, readyNode("node-a"), pool)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateReady {
+		t.Fatalf("state = %q, want Ready", got.Status.State)
+	}
+	n := f.getNode(t, "node-a")
+	if n.Labels["onp.io/pool"] != "a" {
+		t.Errorf("node label onp.io/pool = %q, want a (from pool template)", n.Labels["onp.io/pool"])
+	}
+	if n.Labels["disk"] != "ssd" {
+		t.Errorf("node label disk = %q, want ssd (machine label overrides template)", n.Labels["disk"])
+	}
+	if !hasTaint(n.Spec.Taints, corev1.Taint{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}) {
+		t.Errorf("node taints = %v, want template taint applied", n.Spec.Taints)
+	}
+}
+
+// TestReconcileBootingWarnsOnCapacityDrift: when the now-Ready Node reports a
+// capacity that differs from spec.capacity, ONP becomes Ready and emits a
+// CapacityDrift warning (it does not auto-correct).
+func TestReconcileBootingWarnsOnCapacityDrift(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	m.Spec.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("8")}
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	node := readyNode("node-a")
+	node.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateReady {
+		t.Fatalf("state = %q, want Ready", got.Status.State)
+	}
+	if !hasEvent(f.events(t), reasonCapacityDrift) {
+		t.Errorf("no %s event emitted, want one for the cpu mismatch", reasonCapacityDrift)
+	}
+}
+
+// TestReconcileBootingNoCapacityDriftWhenMatching: matching capacity emits no
+// drift warning.
+func TestReconcileBootingNoCapacityDriftWhenMatching(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	m.Spec.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+
+	node := readyNode("node-a")
+	node.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	if hasEvent(f.events(t), reasonCapacityDrift) {
+		t.Error("CapacityDrift event emitted, want none (capacity matches)")
+	}
+}
+
+// hasEvent reports whether any event string contains reason.
+func hasEvent(events []string, reason string) bool {
+	for _, e := range events {
+		if strings.Contains(e, reason) {
+			return true
+		}
+	}
+	return false
+}
+
+// resourceQty parses a resource.Quantity for tests, failing the build only if the
+// literal is malformed (it never is at call sites).
+func resourceQty(s string) resource.Quantity {
+	return resource.MustParse(s)
 }
