@@ -196,7 +196,7 @@
 
 ### M5.6 — Phase 1 정합성 패스 (DESIGN ↔ 코드 ↔ CLAUDE 불변식)
 
-**왜**: M5 완료 후 디자인 doc·CLAUDE.md 의 안전/확장 불변식 대비 전수 점검에서 7개 갭(C1~C7)을 확정. 모두 additive 또는 동작 강화이고 인터페이스/CRD 스키마는 안 깨짐. 단위 테스트 동반(155 통과), E2E 재검증은 다음 클린 클러스터 배포 시.
+**왜**: M5 완료 후 디자인 doc·CLAUDE.md 의 안전/확장 불변식 대비 전수 점검에서 7개 갭(C1~C7)을 확정. 모두 additive 또는 동작 강화이고 인터페이스/CRD 스키마는 안 깨짐. 단위 테스트 동반(155 통과). 실하드웨어 재검증 완료 — 아래 E2E #4.
 
 - [x] **C1** — operator cordon 흡수 방지: ONP 가 자기 cordon 에 `onp.io/cordoned-by-onp` 마커를 달고, wake/timeout uncordon 시 **마커가 있는 노드만** 해제 (운영자 수동 cordon 보존).
 - [x] **C2** — stale `onp.io/drain-now` 정리: `Off`/`Booting`/`Draining` 진입 시 잔존 drain-now 어노테이션 제거 (재기상 후 즉시 재drain 방지).
@@ -205,6 +205,8 @@
 - [x] **C5** — wol-agent 인증: 컨트롤러↔agent 공유 bearer token(constant-time 비교, `MaxBytesReader`), Helm 토큰 Secret 자동 생성·persist, controller split-brain 가드. (hostNetwork 라 NetworkPolicy 불가 → 토큰이 실질 방어.)
 - [x] **C6** — shutdown-agent 가 `spec.shutdown.provider` 존중: non-agent provider 선택 시 agent 가 전원 안 끔 (Phase 2 hard-cut 경로와 충돌 방지).
 - [x] **C7** — `PowerProvider.PowerStatus` 반환을 `(power.State, error)` 로 안정화 (DESIGN 3.4 인터페이스와 일치, IPMI/Redfish 확장 대비).
+- [x] **검증 (E2E #4)** — 실하드웨어 통과 (2026-06-15, 차트 0.6.0 배포, microk8s desktop/desktop1). 이미지 빌드·푸시 → `helm upgrade` 0.5.0→0.6.0(토큰 Secret 자동 생성·split-brain 가드·CRD 무변·파드 健全), 그리고: **C5** 인증 wake 경로(controller→agent 401 없이 패킷 송신, Off→Booting), **C3** Ready 시 `CapacityDrift` Event(선언 4코어/8Gi vs 실제 20코어/62Gi) + 라벨 적용, **C1** spurious cordon 없음, **A2** 수동 shutdown→`NodeLost`+grace 1분→Ready→Off 모두 관측. C2/C4/C6/A1 은 단위 테스트(155) 커버, scale-down 파괴 경로는 M5 E2E #3(0.5.0) 기검증.
+  - **WoL 하드웨어 한계 발견**: desktop1(RTL8125B)은 **long-off WoL 불안정**(short-off OK / 2일 off 실패, ARP incomplete=링크 down). 전수 점검 결과 ASPM(lspci로 Disabled 확인)/EEE/wakeup 전부 정상이라 원인은 장시간 S5 링크 down — **스위치 green-ethernet 1순위 의심**(이전 ErP 가설은 short-off 성공으로 폐기). ONP는 boot-timeout→Failed 로 안전 처리 — Phase 2 boot-retry/backoff + IPMI provider 가치를 실증.
 
 ---
 
