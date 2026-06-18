@@ -41,6 +41,8 @@
 
 ## Phase 1 — MVP (M1 → M5)
 
+**상태: 완료 ✅** — M1~M5 + 정합성 패스(C1~C7) 전부 구현·머지(PR #5, 차트 0.6.0), 155 단위 테스트 + 실하드웨어 E2E #1~#4 통과. 수직 슬라이스(WoL wake → 자동 scale-up → 안전 scale-down → 운영 폴리시)가 실하드웨어에서 검증됨. 노드 WoL 하드웨어 한계는 아래 "메모 / 결정 기록" 참조(ONP Non-Goal).
+
 각 milestone 의 **Definition of Done** 은 "이걸 사람한테 보여줄 수 있다" 수준의 데모 가능 상태.
 
 ---
@@ -242,4 +244,5 @@
 - **Fit checker** 는 kube-scheduler framework 를 가져오지 않고 핵심 predicate 만 자체 구현 (Karpenter 와 같은 선택).
 - **상태 머신 source of truth** 는 `Machine.status` (CRD-driven choreography). 컨트롤러 ↔ shutdown-agent 사이 직접 RPC 없음.
 - **Phase 1 끄기 경로**는 항상 `shutdown-agent` — `provider.PowerOff` 는 Phase 2 의 hard-cut fallback 용으로 인터페이스에만 자리.
+- **알려진 한계 — 노드 WoL (ONP Non-Goal)**: 검증 환경의 일부 NIC(Realtek RTL8125B)은 장시간 종료 후 WoL 매직 패킷에 응답하지 않는다. 정밀 진단(2026-06-15) 결과 노드 측 설정은 정상(WoL 무장 `g`, ASPM/EEE off, PCI·ACPI wakeup enabled, PME D3cold) — 원인은 장시간 S5 에서 이더넷 링크가 끊기는 것으로, **스위치 포트의 green-ethernet/EEE 가 1순위 의심**(이전 ErP 가설은 short-off 성공으로 폐기). ONP 송신/인증/boot-timeout 은 정상이며 불응답 시 `Failed` 로 안전 처리. 근본 해결은 스위치 EEE off 또는 독립 전원 경로(Intel NIC / Phase 2 IPMI provider).
 - **디자인 doc 권위 출처**: <https://www.industrialempathy.com/posts/design-docs-at-google/>
