@@ -4,13 +4,15 @@ Pending 파드의 spec 을 보고 적합한 on-prem 물리 노드를 Wake-on-LAN
 
 ## 상태
 
-**Phase 1 (MVP) 코드 완료** — M1~M5 구현 + DESIGN/CLAUDE 불변식 정합성 패스(C1~C7) 완료. 단위 테스트 통과, 정합성 패스의 클린 클러스터 E2E 재검증만 남았습니다.
+**Phase 1 (MVP) 완료** ✅ — M1~M5 구현 + DESIGN/CLAUDE 불변식 정합성 패스(C1~C7) 완료. 155 단위 테스트 통과, 실하드웨어 E2E #1~#4 검증 통과(차트 0.6.0). 수직 슬라이스(WoL wake → 자동 scale-up → 안전 scale-down → 운영 폴리시)가 실하드웨어에서 동작 검증됨.
+
+> **알려진 한계 (ONP 스코프 밖)**: 일부 NIC(예: Realtek RTL8125B)은 장시간 종료 후 WoL 매직 패킷에 응답하지 않을 수 있습니다 — NIC/스위치의 하드웨어·펌웨어 특성이며 노드 운영자 책임(Non-Goal). ONP 는 이 경우 boot-timeout → `Failed` 로 안전하게 처리하며, 신뢰성 있는 전원 제어가 필요하면 Phase 2 의 IPMI provider 로 교체할 수 있습니다(pluggable PowerProvider).
 
 - ✅ **M1 — Walking Skeleton**: WoL 매직 패킷 빌더 + `wol-probe` CLI (표준 라이브러리만) + 멀티스테이지 Docker 이미지. 같은 L2 의 실제 꺼진 노드를 깨우는 것까지 end-to-end 검증 완료.
 - ✅ **M2 — 최소 컨트롤러**: `Machine` CRD + 컨트롤러 + `onp-wol-agent` 로 선언적 wake (`onp.io/wake-now` 어노테이션).
 - ✅ **M3 — 자동 scale-up**: `NodePool` CRD + fit 시뮬레이션으로 pending 파드에 맞는 노드를 자동 wake (`maxNodes`/`cooldown` 가드 포함). 실하드웨어 E2E 검증 — wake 부터 파드 스케줄까지 ~40초.
 - ✅ **M4 — Safe Shutdown**: 빈 노드를 자동 drain(PDB 존중) 후 전원 차단. 상태 전이 `Ready → Draining → ShuttingDown → Off`. 실하드웨어 E2E 검증 — 성공경로(빈 노드 자동 종료) + 안전경로(PDB 로 보호된 노드는 drain timeout 시 `Failed` + uncordon, 데이터 무중단) 모두 통과.
-- ✅ **M5 — 운영 폴리시 + 배포**: `minNodes` 하한, `maxConcurrent`, `onp.io/do-not-disrupt`(Node/Pod), `cooldown.scaleDown`, 외부 노드 손실/shutdown 타임아웃 처리, leader election wiring, `onp_*` `/metrics` 5종, Helm 차트 마감(PSA·lease RBAC). 클린 클러스터 E2E 재검증만 남음.
+- ✅ **M5 — 운영 폴리시 + 배포**: `minNodes` 하한, `maxConcurrent`, `onp.io/do-not-disrupt`(Node/Pod), `cooldown.scaleDown`, 외부 노드 손실/shutdown 타임아웃 처리, leader election wiring, `onp_*` `/metrics` 5종, Helm 차트 마감(PSA·lease RBAC). 실하드웨어 E2E #4 검증 통과(차트 0.6.0).
 
 전체 마일스톤(M1 → M5)은 [`ROADMAP.md`](ROADMAP.md) 참조.
 
