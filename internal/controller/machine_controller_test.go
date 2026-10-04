@@ -555,6 +555,36 @@ func TestReconcileReadyWithDrainAnnotationStartsDraining(t *testing.T) {
 	}
 }
 
+// TestReconcileReadyRefusesDrainOnAlwaysOnNode: drain-now on a Machine whose Node
+// is labeled always-on is refused — the Machine stays Ready, the trigger is
+// dropped, the Node is not cordoned, and a DrainRefused Event explains why.
+func TestReconcileReadyRefusesDrainOnAlwaysOnNode(t *testing.T) {
+	t.Parallel()
+
+	node := readyNode("node-a")
+	node.Labels = map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue}
+	f := newFixture(t, machine(v1alpha1.MachineStateReady, map[string]string{
+		v1alpha1.AnnotationDrainNow: v1alpha1.AnnotationDrainNowValue,
+	}), node)
+
+	f.reconcile(t)
+
+	m := f.getMachine(t)
+	if m.Status.State != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want %q", m.Status.State, v1alpha1.MachineStateReady)
+	}
+	if m.Status.DrainStartTime != nil {
+		t.Error("DrainStartTime stamped, want nil (drain refused)")
+	}
+	if _, ok := m.Annotations[v1alpha1.AnnotationDrainNow]; ok {
+		t.Error("drain-now annotation still present, want removed so the refusal does not loop")
+	}
+	if f.getNode(t, "node-a").Spec.Unschedulable {
+		t.Error("always-on Node cordoned, want untouched")
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonDrainRefused)
+}
+
 func TestReconcileDrainingEvictsAndMovesToShuttingDown(t *testing.T) {
 	t.Parallel()
 

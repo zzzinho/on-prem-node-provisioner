@@ -114,6 +114,16 @@ func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if protected {
 		return ctrl.Result{}, r.clearEmptySince(ctx, &m)
 	}
+	// An always-on Node is exempt the same way. startDraining would refuse it
+	// anyway; skipping it here keeps scale-down from re-requesting a drain that
+	// is refused every time.
+	alwaysOn, err := nodeAlwaysOn(ctx, r.Client, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if alwaysOn {
+		return ctrl.Result{}, r.clearEmptySince(ctx, &m)
+	}
 
 	// A Machine matching more than one pool has ambiguous disruption policy — whose
 	// consolidateAfter, whose minNodes/maxConcurrent? Rather than act on a guessed

@@ -71,6 +71,7 @@ const (
 	reasonNodeLost        = "NodeLost"
 	reasonCapacityDrift   = "CapacityDrift"
 	reasonPoolConflict    = "PoolConflict"
+	reasonDrainRefused    = "DrainRefused"
 )
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
@@ -355,7 +356,23 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 // startDraining moves a Ready Machine into Draining in response to drain-now and
 // clears the one-shot trigger. The cordon -> evict -> power-off path runs from
 // reconcileDraining.
+//
+// It is the single gate into the power-off path — manual drain-now and automatic
+// scale-down both arrive here — so it is where an always-on Node is refused: the
+// Machine stays Ready, the trigger is dropped so the refusal is one Event rather
+// than a retry loop, and nothing is cordoned or evicted.
 func (r *MachineReconciler) startDraining(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	alwaysOn, err := nodeAlwaysOn(ctx, r.Client, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if alwaysOn {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainRefused,
+			"refusing to drain Node %q: it is labeled %s=%s and must never be powered off",
+			m.Spec.NodeName, v1alpha1.LabelAlwaysOn, v1alpha1.LabelAlwaysOnValue)
+		return ctrl.Result{}, r.removeDrainAnnotation(ctx, m)
+	}
+
 	now := metav1.NewTime(r.Clock.Now())
 	m.Status.State = v1alpha1.MachineStateDraining
 	m.Status.DrainStartTime = &now
@@ -562,6 +579,22 @@ func (r *MachineReconciler) nodeReady(ctx context.Context, nodeName string) (boo
 		}
 	}
 	return false, nil
+}
+
+// nodeAlwaysOn reports whether the named Node carries the always-on label. A
+// missing Node is not always-on: there is nothing ONP could power off.
+func nodeAlwaysOn(ctx context.Context, c client.Client, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, nil
+	}
+	var node corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get node %q for always-on check: %w", nodeName, err)
+	}
+	return node.Labels[v1alpha1.LabelAlwaysOn] == v1alpha1.LabelAlwaysOnValue, nil
 }
 
 // bootTimedOut reports whether the Machine has been Booting longer than
