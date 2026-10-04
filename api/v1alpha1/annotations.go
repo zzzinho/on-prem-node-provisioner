@@ -49,6 +49,19 @@ const (
 	AnnotationDoNotDisruptValue = "true"
 )
 
+// Label keys ONP reads on Node objects.
+const (
+	// LabelAlwaysOn, set to "true" on a Node, marks it as never powered off: the
+	// control plane and the nodes hosting onp-controller and onp-wol-agent (the
+	// chart pins both there). ONP refuses to drain a Machine backed by such a Node
+	// and never auto-targets it for scale-down, so a Machine declared over it by
+	// mistake cannot take the controller — or the cluster — down with it.
+	LabelAlwaysOn = "onp.io/always-on"
+
+	// LabelAlwaysOnValue is the value LabelAlwaysOn must hold to take effect.
+	LabelAlwaysOnValue = "true"
+)
+
 // Condition types ONP sets on Machine.status.conditions. They follow the
 // standard Kubernetes condition pattern (type, status, lastTransitionTime,
 // reason) so operators can read them with kubectl and tooling can watch them.

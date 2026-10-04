@@ -210,6 +210,16 @@
 - [x] **검증 (E2E #4)** — 실하드웨어 통과 (2026-06-15, 차트 0.6.0 배포, microk8s desktop/desktop1). 이미지 빌드·푸시 → `helm upgrade` 0.5.0→0.6.0(토큰 Secret 자동 생성·split-brain 가드·CRD 무변·파드 健全), 그리고: **C5** 인증 wake 경로(controller→agent 401 없이 패킷 송신, Off→Booting), **C3** Ready 시 `CapacityDrift` Event(선언 4코어/8Gi vs 실제 20코어/62Gi) + 라벨 적용, **C1** spurious cordon 없음, **A2** 수동 shutdown→`NodeLost`+grace 1분→Ready→Off 모두 관측. C2/C4/C6/A1 은 단위 테스트(155) 커버, scale-down 파괴 경로는 M5 E2E #3(0.5.0) 기검증.
   - **WoL 하드웨어 한계 발견**: desktop1(RTL8125B)은 **long-off WoL 불안정**(short-off OK / 2일 off 실패, ARP incomplete=링크 down). 전수 점검 결과 ASPM(lspci로 Disabled 확인)/EEE/wakeup 전부 정상이라 원인은 장시간 S5 링크 down — **스위치 green-ethernet 1순위 의심**(이전 ErP 가설은 short-off 성공으로 폐기). ONP는 boot-timeout→Failed 로 안전 처리 — Phase 2 boot-retry/backoff + IPMI provider 가치를 실증.
 
+### M5.7 — always-on 노드 보호 (차트 0.6.1)
+
+**왜**: `onp.io/always-on` 은 차트가 컨트롤러·wol-agent 를 고정하는 데만 쓰였고, 컨트롤러 자신은 이 라벨을 몰랐다. always-on 노드 위에 Machine 을 잘못 선언하면 ONP 가 자기(와 컨트롤 플레인)를 drain·종료할 수 있었다. 또 `leaderElect: false` 인데 RollingUpdate 라 업그레이드 때마다 컨트롤러 두 개가 몇 초씩 동시에 active 였다(split-brain 창).
+
+- [x] **always-on drain 거부** — 수동 drain-now 와 자동 scale-down 이 만나는 유일한 관문 `startDraining` 에서, 백킹 Node 가 `onp.io/always-on=true` 면 Ready 유지 + drain-now 제거 + `DrainRefused` Warning Event. cordon·eviction 없음.
+- [x] **scale-down 제외** — always-on 노드는 Node `do-not-disrupt` 처럼 empty 타이머를 시작하지 않는다. 거부된 drain 을 scale-down 이 계속 재요청하는 루프 방지.
+- [x] **Recreate 롤아웃** — `controller.leaderElect: false` 면 Deployment strategy 를 `Recreate` 로 렌더(구 파드 종료 후 신 파드 시작).
+  - **Helm 4 업그레이드 주의**: Helm 4 는 server-side apply 라, 0.6.0 이하에서 올리면 apiserver 가 기본값으로 채운 `strategy.rollingUpdate`(소유자 없음)가 남아 `rollingUpdate: Forbidden ... 'Recreate'` 로 실패한다(템플릿에 `rollingUpdate: null` 을 넣어도 동일). 업그레이드 전에 한 번만 `kubectl -n onp-system patch deploy onp-controller --type=json -p '[{"op":"remove","path":"/spec/strategy/rollingUpdate"},{"op":"replace","path":"/spec/strategy/type","value":"Recreate"}]'`. strategy 는 파드 템플릿 밖이라 롤아웃을 일으키지 않는다. 신규 설치·Helm 3 업그레이드는 해당 없음.
+- [x] **검증** — 실클러스터 배포 (2026-10-04, `helm upgrade` 0.6.0→0.6.1, 위 1회 패치 후). 컨트롤러·wol-agent 0.6.1 이 always-on 노드(desktop1)에서 Running, strategy `Recreate`, 에러 로그 없음. 거부 경로 자체는 단위 테스트로 커버(가드 제거 시 두 테스트 실패 확인) — always-on 노드를 실제로 drain 시도하는 라이브 검증은 하지 않는다.
+
 ---
 
 ## Phase 2 — 운영성

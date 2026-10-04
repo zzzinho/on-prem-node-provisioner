@@ -489,6 +489,32 @@ func TestScaleDownSkipsDoNotDisruptNode(t *testing.T) {
 	}
 }
 
+// TestScaleDownSkipsAlwaysOnNode: an always-on Node is never auto-targeted, even
+// past consolidateAfter — no drain-now, and the stale timer is cleared — so
+// scale-down does not keep re-requesting a drain startDraining would refuse.
+func TestScaleDownSkipsAlwaysOnNode(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-a",
+		Labels: map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue},
+	}}
+	pool := whenEmptyPool("edge", &after)
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clk, m, node, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	got := getSDMachine(t, cl, "node-a")
+	if drainNowSet(got) {
+		t.Fatal("drain-now set on an always-on node; scale-down must skip it")
+	}
+	if got.Status.EmptySince != nil {
+		t.Fatal("emptySince kept on an always-on node, want cleared")
+	}
+}
+
 // TestScaleDownTreatsDoNotDisruptPodAsWorkload: a do-not-disrupt pod keeps its node
 // non-empty, so the node is never auto-targeted — no special case beyond counting
 // the pod as workload.
