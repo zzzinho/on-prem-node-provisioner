@@ -226,6 +226,7 @@
 
 - [x] **drain 이 종료 중 파드를 기다림** — `isWorkload` 가 Terminating 파드도 노드를 차지하는 것으로 센다(`kubectl drain` 의 wait-for-delete 와 같은 의미). `isDrainable` 은 이미 종료 중인 파드를 다시 evict 하지 않는다. 영영 안 사라지면 기존 drain timeout → `Failed` + uncordon 이 backstop. scale-down 의 empty 판정도 같은 정의를 써서 파드가 실제로 사라진 뒤에 타이머를 시작한다.
 - [x] **Booting 중 PowerOn 재전송** — Node 가 아직 Ready 가 아니면 첫 폴링 간격(15초) 이후 매 폴링마다 `PowerOn` 을 다시 보낸다. 켜진 보드에 power-on 은 no-op 이라 안전, CRD 변경 없음. `Failed` 이후 재시도는 여전히 Phase 2.
+- [x] **검증** — 실하드웨어 (2026-10-05, 차트 0.6.2, desktop 이 S5 로 ~40분 꺼진 뒤 `Failed → Off` 복구 + wake-now). 08:23:48 첫 `PowerOn` → 08:24:03·08:24:18 재전송(15초 간격) → 08:24:20 Node Ready + `Uncordoned`. 재전송은 부팅 중 무해함을 확인(이번엔 첫 패킷으로 깨어남). drain 대기 수정은 단위 테스트로 커버, 실하드웨어 drain 은 다음 전원 사이클에서 확인.
 
 ---
 
