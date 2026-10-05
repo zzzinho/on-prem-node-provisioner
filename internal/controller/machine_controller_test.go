@@ -235,6 +235,32 @@ func TestReconcileBootingNodeReadyBecomesReady(t *testing.T) {
 	}
 }
 
+// TestReconcileBootingResendsPowerOn: while the Node is not yet Ready, each poll
+// past the first re-sends the power-on, so one lost WoL packet (sent while the
+// board was still halting) does not run the boot out into Failed.
+func TestReconcileBootingResendsPowerOn(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	f := newFixture(t, m, notReadyNode("node-a"))
+
+	f.reconcile(t)
+	if f.provider.powerOnCalls != 0 {
+		t.Fatalf("PowerOn calls = %d, want 0 within the first poll interval", f.provider.powerOnCalls)
+	}
+
+	f.clock.Step(bootPollInterval)
+	f.reconcile(t)
+	if f.provider.powerOnCalls != 1 {
+		t.Fatalf("PowerOn calls = %d, want 1 re-send once a poll interval has passed", f.provider.powerOnCalls)
+	}
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateBooting {
+		t.Errorf("state = %q, want %q (a re-send does not change state)", got, v1alpha1.MachineStateBooting)
+	}
+}
+
 func (f *reconcilerFixture) getNode(t *testing.T, name string) *corev1.Node {
 	t.Helper()
 	var n corev1.Node
@@ -654,22 +680,59 @@ func TestReconcileDrainingExcludesUnevictablePods(t *testing.T) {
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	deleting := normalPod("terminating-1", "node-a")
-	delTime := metav1.NewTime(time.Now())
-	deleting.DeletionTimestamp = &delTime
-	deleting.Finalizers = []string{"keep-alive"} // a DeletionTimestamp needs a finalizer to persist
-
-	f := newFixture(t, m, readyNode("node-a"), dsPod, mirrorPod, deleting)
+	f := newFixture(t, m, readyNode("node-a"), dsPod, mirrorPod)
 
 	f.reconcile(t)
 
-	// None of the three are evictable, so the node reads as drained and the
-	// Machine advances with no Evict calls.
+	// Neither is evictable, so the node reads as drained and the Machine advances
+	// with no Evict calls.
 	if len(f.evicted) != 0 {
 		t.Errorf("evicted = %v, want none (all pods unevictable)", f.evicted)
 	}
 	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateShuttingDown {
 		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateShuttingDown)
+	}
+}
+
+// TestReconcileDrainingWaitsForTerminatingPod: an evicted pod still terminating
+// keeps the node non-empty — the drain neither evicts it again nor moves to
+// ShuttingDown until the pod is gone, so power-off never cuts its graceful
+// shutdown short.
+func TestReconcileDrainingWaitsForTerminatingPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	deleting := normalPod("terminating-1", "node-a")
+	delTime := metav1.NewTime(time.Now())
+	deleting.DeletionTimestamp = &delTime
+	deleting.Finalizers = []string{"keep-alive"} // a DeletionTimestamp needs a finalizer to persist
+
+	f := newFixture(t, m, readyNode("node-a"), deleting)
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none (pod already terminating)", f.evicted)
+	}
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateDraining {
+		t.Fatalf("state = %q, want %q while the pod is still terminating", got, v1alpha1.MachineStateDraining)
+	}
+
+	// The pod finishes its shutdown: dropping the finalizer lets it go.
+	var pod corev1.Pod
+	if err := f.cl.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "terminating-1"}, &pod); err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	pod.Finalizers = nil
+	if err := f.cl.Update(context.Background(), &pod); err != nil {
+		t.Fatalf("release pod: %v", err)
+	}
+	f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateShuttingDown {
+		t.Errorf("state = %q, want %q once the pod is gone", got, v1alpha1.MachineStateShuttingDown)
 	}
 }
 

@@ -311,7 +311,36 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 		return ctrl.Result{}, nil
 	}
 
+	r.resendPowerOn(ctx, m)
 	return ctrl.Result{RequeueAfter: r.requeueForBoot(m)}, nil
+}
+
+// resendPowerOn repeats the power-on while a Machine is Booting. One command can
+// be lost: Off is entered when the Node goes NotReady, which happens when the
+// kubelet stops — before the OS has finished halting — so an immediate re-wake's
+// WoL packet can land while the board is still going down and be dropped. Without
+// a resend the boot would run out the clock into Failed. A power-on is a no-op on
+// a board that is already on, so repeating it is safe.
+//
+// ponytail: resends on every Booting reconcile past the first poll interval
+// (~bootPollInterval apart in practice); add a status.lastPowerOnTime anchor if a
+// provider ever needs a real rate limit.
+func (r *MachineReconciler) resendPowerOn(ctx context.Context, m *v1alpha1.Machine) {
+	if m.Status.BootStartTime == nil || r.Clock.Since(m.Status.BootStartTime.Time) < bootPollInterval {
+		return
+	}
+	provider, ok := r.Registry.Get(m.Spec.Power.Provider)
+	if !ok || !provider.Capabilities().CanPowerOn {
+		return
+	}
+	err := provider.PowerOn(ctx, m)
+	metrics.RecordPowerOn(m.Spec.Power.Provider, err)
+	if err != nil {
+		// Stay Booting: the boot timeout is the backstop, and the next poll retries.
+		log.FromContext(ctx).Error(err, "re-send power-on failed", "machine", m.Name)
+		return
+	}
+	log.FromContext(ctx).V(1).Info("re-sent power-on while booting", "machine", m.Name)
 }
 
 // reconcileReady tidies a leftover wake-now annotation, starts a drain when the
@@ -466,7 +495,8 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	// do-not-disrupt pods, which an unforced drain will not evict. So a node
 	// carrying only a do-not-disrupt pod never reads empty here; the drain stalls
 	// below until the timeout above fails it, rather than powering the node off
-	// with the protected pod still on it.
+	// with the protected pod still on it. Evicted pods still terminating count too,
+	// so power-off waits out their graceful shutdown.
 	workload, err := r.workloadPods(ctx, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list workload pods on node %q: %w", m.Spec.NodeName, err)
@@ -940,7 +970,13 @@ func evictViaSubResource(ctx context.Context, c client.Client, pod *corev1.Pod) 
 // it before the node can power off, and the scale-down path counts it as occupying
 // the node. The exclusions match kubectl drain's defaults: DaemonSet-owned pods
 // (rescheduled to the node regardless), mirror/static pods (not API-managed),
-// already-terminating pods, and finished pods.
+// and finished pods.
+//
+// A terminating pod is still workload: it runs its graceful shutdown (preStop,
+// terminationGracePeriodSeconds) on this node until it is gone, so — like kubectl
+// drain, which waits for evicted pods to be deleted — the node is not empty, and
+// must not be powered off, until then. isDrainable keeps the drain from evicting
+// it a second time.
 //
 // A do-not-disrupt pod is still workload — it keeps the node non-empty, so
 // scale-down never targets its node and a drain never reports the node empty while
@@ -948,9 +984,6 @@ func evictViaSubResource(ctx context.Context, c client.Client, pod *corev1.Pod) 
 // isDrainable: emptiness (this function) and evictability (isDrainable) diverge
 // precisely on do-not-disrupt, which is why they are two predicates, not one.
 func isWorkload(pod *corev1.Pod) bool {
-	if pod.DeletionTimestamp != nil {
-		return false
-	}
 	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 		return false
 	}
@@ -969,9 +1002,10 @@ func isWorkload(pod *corev1.Pod) bool {
 // minus do-not-disrupt pods, which an unforced drain must not evict — so a node
 // carrying only a do-not-disrupt pod never empties and the drain times out into
 // Failed rather than disrupting the pod. force lifts the exemption: an operator who
-// sets drain.force has explicitly opted into evicting protected pods.
+// sets drain.force has explicitly opted into evicting protected pods. A pod already
+// terminating has been evicted (or deleted) once; the drain just waits for it.
 func isDrainable(pod *corev1.Pod, force bool) bool {
-	if !isWorkload(pod) {
+	if !isWorkload(pod) || pod.DeletionTimestamp != nil {
 		return false
 	}
 	if force {

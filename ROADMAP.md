@@ -220,6 +220,14 @@
   - **Helm 4 업그레이드 주의**: Helm 4 는 server-side apply 라, 0.6.0 이하에서 올리면 apiserver 가 기본값으로 채운 `strategy.rollingUpdate`(소유자 없음)가 남아 `rollingUpdate: Forbidden ... 'Recreate'` 로 실패한다(템플릿에 `rollingUpdate: null` 을 넣어도 동일). 업그레이드 전에 한 번만 `kubectl -n onp-system patch deploy onp-controller --type=json -p '[{"op":"remove","path":"/spec/strategy/rollingUpdate"},{"op":"replace","path":"/spec/strategy/type","value":"Recreate"}]'`. strategy 는 파드 템플릿 밖이라 롤아웃을 일으키지 않는다. 신규 설치·Helm 3 업그레이드는 해당 없음.
 - [x] **검증** — 실클러스터 배포 (2026-10-04, `helm upgrade` 0.6.0→0.6.1, 위 1회 패치 후). 컨트롤러·wol-agent 0.6.1 이 always-on 노드(desktop1)에서 Running, strategy `Recreate`, 에러 로그 없음. 거부 경로 자체는 단위 테스트로 커버(가드 제거 시 두 테스트 실패 확인) — always-on 노드를 실제로 drain 시도하는 라이브 검증은 하지 않는다.
 
+### M5.8 — drain 완료 판정 + Booting 중 PowerOn 재전송 (차트 0.6.2)
+
+**왜**: on-demand 노드(desktop) 실하드웨어 전원 사이클(2026-10-05)에서 두 결함이 드러났다. ① eviction 이 받아들여지는 순간 종료 중(Terminating) 파드를 워크로드에서 빼서, `Draining`·`DrainSucceeded`·전원 차단이 같은 초에 일어났다 — 파드의 graceful 종료(preStop, `terminationGracePeriodSeconds`)를 기다리지 않고 OS 를 내림. ② `ShuttingDown → Off` 는 Node NotReady(=kubelet 정지) 시점이라 OS 종료 완료보다 앞선다. Pending 파드 때문에 scale-up 이 Off 직후(+60초) 깨웠고, 아직 S5 에 못 들어간 보드가 매직 패킷을 버려 boot-timeout(10분) → `Failed` 로 끝났다.
+
+- [x] **drain 이 종료 중 파드를 기다림** — `isWorkload` 가 Terminating 파드도 노드를 차지하는 것으로 센다(`kubectl drain` 의 wait-for-delete 와 같은 의미). `isDrainable` 은 이미 종료 중인 파드를 다시 evict 하지 않는다. 영영 안 사라지면 기존 drain timeout → `Failed` + uncordon 이 backstop. scale-down 의 empty 판정도 같은 정의를 써서 파드가 실제로 사라진 뒤에 타이머를 시작한다.
+- [x] **Booting 중 PowerOn 재전송** — Node 가 아직 Ready 가 아니면 첫 폴링 간격(15초) 이후 매 폴링마다 `PowerOn` 을 다시 보낸다. 켜진 보드에 power-on 은 no-op 이라 안전, CRD 변경 없음. `Failed` 이후 재시도는 여전히 Phase 2.
+- [x] **검증** — 실하드웨어 (2026-10-05, 차트 0.6.2, desktop 이 S5 로 ~40분 꺼진 뒤 `Failed → Off` 복구 + wake-now). 08:23:48 첫 `PowerOn` → 08:24:03·08:24:18 재전송(15초 간격) → 08:24:20 Node Ready + `Uncordoned`. 재전송은 부팅 중 무해함을 확인(이번엔 첫 패킷으로 깨어남). drain 대기 수정은 단위 테스트로 커버, 실하드웨어 drain 은 다음 전원 사이클에서 확인.
+
 ---
 
 ## Phase 2 — 운영성

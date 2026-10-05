@@ -260,7 +260,7 @@ sequenceDiagram
     Sched->>API: bind Pod → Node
 ```
 
-boot timeout (컨트롤러 플래그 `--boot-timeout`, 기본 10분) 내에 Node Ready 가 관찰되지 않으면 컨트롤러는 `Machine.status.state = Failed` 로 옮기고 Event를 발생시킨다. 풀 단위가 아니라 컨트롤러 전역 설정인 이유는, 부트 SLA 가 워크로드 정책(`NodePool`)이 아니라 하드웨어·BIOS·네트워크 특성에 달려 있어 배포 단위로 한 번 정하는 게 자연스럽기 때문이다. 재시도 정책은 Phase 2.
+boot timeout (컨트롤러 플래그 `--boot-timeout`, 기본 10분) 내에 Node Ready 가 관찰되지 않으면 컨트롤러는 `Machine.status.state = Failed` 로 옮기고 Event를 발생시킨다. 풀 단위가 아니라 컨트롤러 전역 설정인 이유는, 부트 SLA 가 워크로드 정책(`NodePool`)이 아니라 하드웨어·BIOS·네트워크 특성에 달려 있어 배포 단위로 한 번 정하는 게 자연스럽기 때문이다. Booting 동안에는 폴링 간격(15초)마다 `PowerOn` 을 재전송한다 — `Off` 진입(Node NotReady)은 kubelet 이 멈추는 시점이라 OS 종료 완료보다 앞서고, 그 직후 보낸 첫 매직 패킷은 버려질 수 있기 때문이다(켜진 보드에 power-on 은 no-op 이라 반복해도 안전). `Failed` 이후의 재시도 정책은 Phase 2.
 
 **Cordon 수명주기 (scale-down ↔ scale-up 연결).** scale-down 이 cordon 한 노드는 `Draining → ShuttingDown → Off` 내내 cordon 된 채로 전원이 꺼지고, 이후 scale-up 으로 다시 깨어나 `Ready` 가 될 때 컨트롤러가 자동으로 uncordon 한다. Phase 1 노드는 long-lived 라 같은 Node 객체가 재사용되므로, cordon 을 안 풀면 깨운 노드가 `unschedulable` 로 남아 정작 깨운 원인이 된 pending 파드를 못 받는다. 운영자가 손으로 cordon 한 노드까지 풀어버리지 않도록, ONP 는 자기가 cordon 할 때 Node 에 `onp.io/cordoned-by-onp` 마커를 달고 wake 시 **마커가 있는 노드만** uncordon 한다 (drain timeout 경로의 uncordon 도 같은 마커를 지운다). 클라우드 오토스케일러가 노드를 통째로 버리고 새로 만드는 것과 달리, on-prem 의 "같은 노드를 껐다 켠다" 모델에서 생기는 고유한 수명주기다.
 
@@ -417,7 +417,7 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 
 | 실패 | 컨트롤러 동작 | 비고 |
 | --- | --- | --- |
-| 부트 타임아웃 (`bootTimeout` 내 Node Ready 없음) | `Machine.status.state = Failed` + Event | retry / backoff 는 Phase 2 |
+| 부트 타임아웃 (`bootTimeout` 내 Node Ready 없음) | Booting 중 폴링마다 `PowerOn` 재전송, 그래도 Ready 없으면 `Machine.status.state = Failed` + Event | `Failed` 이후 retry / backoff 는 Phase 2 |
 | 매직 패킷 손실 (WoL ack 없음) | 같음 — Node Ready 신호로만 성공 판정 | provider 일반의 원칙 |
 | Drain 행 (PDB 등) | `Failed` + uncordon + Event | `force=true` opt-in 시 강제 진행 |
 | 컨트롤러 재시작 | reconcile 재개 — `Machine.status` 가 source of truth | CRD-driven 상태 머신의 이점 |
