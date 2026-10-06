@@ -227,6 +227,22 @@
 - [x] **drain 이 종료 중 파드를 기다림** — `isWorkload` 가 Terminating 파드도 노드를 차지하는 것으로 센다(`kubectl drain` 의 wait-for-delete 와 같은 의미). `isDrainable` 은 이미 종료 중인 파드를 다시 evict 하지 않는다. 영영 안 사라지면 기존 drain timeout → `Failed` + uncordon 이 backstop. scale-down 의 empty 판정도 같은 정의를 써서 파드가 실제로 사라진 뒤에 타이머를 시작한다.
 - [x] **Booting 중 PowerOn 재전송** — Node 가 아직 Ready 가 아니면 첫 폴링 간격(15초) 이후 매 폴링마다 `PowerOn` 을 다시 보낸다. 켜진 보드에 power-on 은 no-op 이라 안전, CRD 변경 없음. `Failed` 이후 재시도는 여전히 Phase 2.
 - [x] **검증** — 실하드웨어 (2026-10-05, 차트 0.6.2, desktop 이 S5 로 ~40분 꺼진 뒤 `Failed → Off` 복구 + wake-now). 08:23:48 첫 `PowerOn` → 08:24:03·08:24:18 재전송(15초 간격) → 08:24:20 Node Ready + `Uncordoned`. 재전송은 부팅 중 무해함을 확인(이번엔 첫 패킷으로 깨어남). drain 대기 수정은 단위 테스트로 커버, 실하드웨어 drain 은 다음 전원 사이클에서 확인.
+- [x] **drain 대기 실하드웨어 확인** (2026-10-05) — drain-now → 기존 decode 파드가 09:03:48 에 사라진 뒤 09:03:56 `DrainSucceeded`(0.6.1 에선 eviction 과 같은 초). Off 7초 뒤 자동 wake 의 첫 패킷은 버려졌고(부팅 89초, 정상 32초) 15초 간격 재전송으로 `Failed` 없이 Ready.
+
+### M5.9 — 전수 점검 안전 수정 (차트 0.6.3)
+
+**왜**: 0.6.2 검증 중 scale-down binding 버그를 찾은 뒤 코드 전체를 4개 영역으로 나눠 점검했다(2026-10-05). 안전 그룹(엉뚱한 노드를 끄거나 minNodes·maxConcurrent·always-on 보장이 깨지는 경로)을 먼저 고친다. 상태 고착(0.6.4), fit 정확도(0.7.0), 관측성·잡음은 뒤 릴리스.
+
+- [x] **binding 반응** — scale-down Pod predicate 가 파드의 노드 배정(nodeName "" → X) update 를 받는다. 배정 직전에 찍힌 `emptySince` 가 남아 실제로 몇 초만 빈 노드가 drain 되던 경로를 막음.
+- [x] **가드를 최신 상태로** — scale-down 이 트리거 직전 풀·멤버·자기 자신을 `mgr.GetAPIReader()` 로 다시 읽고 cooldown·minNodes·maxConcurrent 를 평가. 연달아 트리거된 같은 풀의 Machine 둘이 캐시 지연으로 둘 다 drain 되던 경로를 막음.
+- [x] **nodeName 불변 + 중복 정지** — CRD CEL `self == oldSelf`. 같은 Node 를 가리키는 Machine 이 둘 이상이면 모든 전원 동작 정지 + `DuplicateNode` Event.
+- [x] **always-on 전 구간** — drain 매 패스 재확인(걸리면 중단·uncordon·Ready), shutdown-agent DaemonSet nodeAffinity `onp.io/always-on NotIn ["true"]`, template/Machine 라벨로 `onp.io/always-on` 을 쓰지 못함(`ReservedLabel` Event).
+- [x] **Off 확정 조건** — Node Ready 의 `lastTransitionTime` 이 `shutdownStartTime` 이후일 때만 Off. 그 전부터 NotReady 면 shutdown timeout 후 `Failed`.
+- [x] **shutdown-agent 회차 멱등** — `sync.Once`(프로세스 수명) 대신 `shutdownStartTime` 회차당 한 번. 호스트 부팅 시각이 요청보다 뒤면 다시 끄지 않음(`PowerOffSkipped`).
+- [x] **cordon 후 대기 + API 확인** — 새로 cordon 한 패스는 판정 없이 한 폴링 대기, ShuttingDown 직전 노드 파드를 API 로 재확인.
+- [x] **설계 원칙** — CLAUDE.md 에 SRP/OCP 추가. 안전 판정 함수는 `internal/controller/guards.go` 로 모음.
+- **업그레이드**: Machine CRD 가 바뀌었으므로 `kubectl apply -f charts/onp/crds/` 후 `helm upgrade` (Helm 은 crds/ 를 업그레이드하지 않음).
+- [x] **검증** — 실클러스터 배포 (2026-10-06, CRD apply → `helm upgrade` 0.6.2→0.6.3). `desktop` Machine 의 nodeName 변경 dry-run 이 `nodeName is immutable` 로 거부됨, shutdown-agent DaemonSet 에 always-on 제외 affinity 반영, 세 컴포넌트 0.6.3 Running·에러 로그 없음. 각 수정은 단위 테스트로 커버(수정을 되돌리면 해당 테스트가 실패함을 확인). 전원 사이클로 하는 실하드웨어 확인은 하지 않음.
 
 ---
 
