@@ -634,3 +634,50 @@ func TestScaleDownGuardsUseFreshState(t *testing.T) {
 	}
 	assertEvent(t, rec, reasonScaleDownBlocked)
 }
+
+// TestNodeExemptionChanged: a Node update wakes scale-down only when it flips an
+// exemption — do-not-disrupt or always-on — not on kubelet status writes.
+func TestNodeExemptionChanged(t *testing.T) {
+	plain := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	protected := plain.DeepCopy()
+	protected.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	alwaysOn := plain.DeepCopy()
+	alwaysOn.Labels = map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue}
+	statusOnly := plain.DeepCopy()
+	statusOnly.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+
+	tests := []struct {
+		name     string
+		old, new *corev1.Node
+		want     bool
+	}{
+		{"do-not-disrupt lifted", protected, plain, true},
+		{"always-on added", plain, alwaysOn, true},
+		{"status heartbeat", plain, statusOnly, false},
+	}
+	pred := nodeExemptionChanged()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pred.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
+				t.Errorf("Update() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScaleDownMembersOfPool: a NodePool event re-evaluates exactly the Machines
+// its selector matches, so enabling a policy starts their empty timers.
+func TestScaleDownMembersOfPool(t *testing.T) {
+	after := 5 * time.Minute
+	member := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	outsider := sdMachine("node-x", v1alpha1.MachineStateReady, nil)
+	outsider.Labels = map[string]string{"pool": "other"}
+	pool := whenEmptyPool("edge", &after)
+	r, _ := newScaleDownReconciler(t, record.NewFakeRecorder(1), clocktesting.NewFakePassiveClock(scaleDownBase), member, outsider, pool)
+
+	reqs := r.membersOfPool(context.Background(), pool)
+
+	if len(reqs) != 1 || reqs[0].Name != "node-a" {
+		t.Fatalf("membersOfPool = %v, want one request for node-a", reqs)
+	}
+}

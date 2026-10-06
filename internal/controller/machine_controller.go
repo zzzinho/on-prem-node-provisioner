@@ -1251,16 +1251,5 @@ func (r *MachineReconciler) machinesForNode(ctx context.Context, obj client.Obje
 	if !ok {
 		return nil
 	}
-	var machines v1alpha1.MachineList
-	if err := r.List(ctx, &machines, client.MatchingFields{IndexMachineNodeName: node.Name}); err != nil {
-		log.FromContext(ctx).Error(err, "list machines for node", "node", node.Name)
-		return nil
-	}
-	requests := make([]reconcile.Request, 0, len(machines.Items))
-	for i := range machines.Items {
-		requests = append(requests, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: machines.Items[i].Name},
-		})
-	}
-	return requests
+	return requestsForMachinesOnNode(ctx, r.Client, node.Name)
 }
