@@ -36,44 +36,66 @@ type Result struct {
 	Reason string
 }
 
+// Predicate is one hard scheduling rule. It returns "" when pod may run on node
+// and otherwise a short, human-readable reason. A new rule is added as a
+// Predicate — to defaultPredicates, or passed to Fit by a caller that holds the
+// cluster state the rule needs — never by editing Fit.
+type Predicate func(pod *corev1.Pod, node *corev1.Node) string
+
+// defaultPredicates are the rules every fit check applies, in order: the cheap
+// label and taint matches before the resource sums.
+var defaultPredicates = []Predicate{matchesNodeAffinity, toleratesHardTaints, fitsRequests}
+
 // Fit reports whether pod could schedule onto node, considering only the
-// predicates ONP can evaluate without live cluster state: resource requests,
-// nodeSelector + required node affinity, and taint toleration. The node is
-// typically synthetic — assembled from a (possibly powered-off) Machine's
-// declared capacity, labels, and taints — so node.Status.Allocatable is the
-// authoritative capacity.
+// predicates ONP can evaluate without live cluster state, plus any extra ones the
+// caller supplies. The node is typically synthetic — assembled from a (possibly
+// powered-off) Machine's declared capacity, labels, and taints — so
+// node.Status.Allocatable is the authoritative capacity.
 //
-// Predicates are checked label/affinity, taints, then resources; on the first
-// failure it returns Fits:false with a specific Reason. All passing yields
-// Fits:true with an empty Reason.
-func Fit(pod *corev1.Pod, node *corev1.Node) Result {
-	// nodeSelector + required nodeAffinity. GetRequiredNodeAffinity folds both
-	// into one matcher and handles every operator (In/NotIn/Exists/...). Match
-	// only errors on a malformed selector, which we treat as a non-fit.
+// On the first failing predicate it returns Fits:false with that Reason; all
+// passing yields Fits:true with an empty Reason.
+func Fit(pod *corev1.Pod, node *corev1.Node, extra ...Predicate) Result {
+	for _, predicates := range [][]Predicate{defaultPredicates, extra} {
+		for _, p := range predicates {
+			if reason := p(pod, node); reason != "" {
+				return Result{Reason: reason}
+			}
+		}
+	}
+	return Result{Fits: true}
+}
+
+// matchesNodeAffinity checks nodeSelector + required nodeAffinity.
+// GetRequiredNodeAffinity folds both into one matcher and handles every operator
+// (In/NotIn/Exists/...). Match only errors on a malformed selector, which counts
+// as a non-fit.
+func matchesNodeAffinity(pod *corev1.Pod, node *corev1.Node) string {
 	required := nodeaffinity.GetRequiredNodeAffinity(pod)
 	if ok, err := required.Match(node); err != nil || !ok {
-		return Result{Reason: "node selector / required affinity not satisfied"}
+		return "node selector / required affinity not satisfied"
 	}
+	return ""
+}
 
-	// Taints: a NoSchedule or NoExecute taint the pod does not tolerate is a hard
-	// failure. PreferNoSchedule is a scheduling preference, not a predicate, so the
-	// filter excludes it.
+// toleratesHardTaints fails on a NoSchedule or NoExecute taint the pod does not
+// tolerate. PreferNoSchedule is a scheduling preference, not a predicate, so the
+// filter excludes it.
+func toleratesHardTaints(pod *corev1.Pod, node *corev1.Node) string {
 	if taint, untolerated := v1helper.FindMatchingUntoleratedTaint(
 		node.Spec.Taints,
 		pod.Spec.Tolerations,
 		isHardTaint,
 	); untolerated {
-		return Result{Reason: fmt.Sprintf("untolerated taint {key=%s effect=%s}", taint.Key, taint.Effect)}
+		return fmt.Sprintf("untolerated taint {key=%s effect=%s}", taint.Key, taint.Effect)
 	}
+	return ""
+}
 
-	// Resources: PodRequests correctly accounts for init containers, native
-	// sidecars (restartable init containers), and pod overhead — do not hand-roll.
-	requests := resource.PodRequests(pod, resource.PodResourcesOptions{})
-	if reason := fitsResources(requests, node.Status.Allocatable); reason != "" {
-		return Result{Reason: reason}
-	}
-
-	return Result{Fits: true}
+// fitsRequests checks the pod's requests against the node's allocatable.
+// PodRequests correctly accounts for init containers, native sidecars
+// (restartable init containers), and pod overhead — do not hand-roll.
+func fitsRequests(pod *corev1.Pod, node *corev1.Node) string {
+	return fitsResources(resource.PodRequests(pod, resource.PodResourcesOptions{}), node.Status.Allocatable)
 }
 
 // isHardTaint admits only the taint effects that act as hard scheduling

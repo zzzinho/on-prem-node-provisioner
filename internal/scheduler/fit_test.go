@@ -245,3 +245,19 @@ func TestFit(t *testing.T) {
 		})
 	}
 }
+
+// TestFitAppliesExtraPredicates: a caller-supplied predicate runs after the
+// defaults and its reason is reported; a node that passes it still fits.
+func TestFitAppliesExtraPredicates(t *testing.T) {
+	n := node(list("cpu", "4"), nil, nil)
+	p := pod(list("cpu", "1"))
+	reject := func(*corev1.Pod, *corev1.Node) string { return "rejected by caller" }
+	accept := func(*corev1.Pod, *corev1.Node) string { return "" }
+
+	if got := scheduler.Fit(p, n, reject); got.Fits || got.Reason != "rejected by caller" {
+		t.Errorf("Fit(reject) = %+v, want Fits=false Reason=%q", got, "rejected by caller")
+	}
+	if got := scheduler.Fit(p, n, accept); !got.Fits {
+		t.Errorf("Fit(accept) = %+v, want Fits=true", got)
+	}
+}
