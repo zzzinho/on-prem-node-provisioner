@@ -52,3 +52,21 @@ func otherMachinesOnNode(ctx context.Context, c client.Client, m *v1alpha1.Machi
 	}
 	return others, nil
 }
+
+// reservedNodeLabels are Node labels only an operator sets. ONP reads them as
+// safety signals, so a NodePool template or Machine label must not be able to
+// write — and so silently flip — them.
+var reservedNodeLabels = []string{v1alpha1.LabelAlwaysOn}
+
+// dropReservedLabels deletes the reserved keys from labels in place and returns
+// the keys it removed, in reservedNodeLabels order.
+func dropReservedLabels(labels map[string]string) []string {
+	var dropped []string
+	for _, k := range reservedNodeLabels {
+		if _, ok := labels[k]; ok {
+			delete(labels, k)
+			dropped = append(dropped, k)
+		}
+	}
+	return dropped
+}

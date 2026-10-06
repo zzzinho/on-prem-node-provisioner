@@ -73,6 +73,7 @@ const (
 	reasonPoolConflict    = "PoolConflict"
 	reasonDrainRefused    = "DrainRefused"
 	reasonDuplicateNode   = "DuplicateNode"
+	reasonReservedLabel   = "ReservedLabel"
 )
 
 // duplicateNodeRecheck is how often a Machine held because another Machine
@@ -482,6 +483,16 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	if err := r.removeDrainAnnotation(ctx, m); err != nil {
 		return ctrl.Result{}, err
 	}
+	// startDraining refuses an always-on Node when a drain starts; a label added
+	// while the drain runs — an operator stopping a mistaken drain — is honored
+	// on every pass too, before any more pods are touched.
+	alwaysOn, err := nodeAlwaysOn(ctx, r.Client, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if alwaysOn {
+		return r.abortDrain(ctx, m)
+	}
 	timeout, force, err := r.drainPolicy(ctx, m)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -560,6 +571,27 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	}
 
 	return ctrl.Result{RequeueAfter: drainPollInterval}, nil
+}
+
+// abortDrain stops a drain whose Node turned out to be always-on: it lifts the
+// cordon ONP placed and returns the Machine to Ready. Pods already evicted stay
+// evicted — the scheduler places them again — but nothing else is touched and
+// the node is never powered off.
+func (r *MachineReconciler) abortDrain(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	if _, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName); err != nil {
+		return ctrl.Result{}, err
+	}
+	m.Status.State = v1alpha1.MachineStateReady
+	m.Status.DrainStartTime = nil
+	setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionFalse, reasonDrainRefused,
+		fmt.Sprintf("Node %q is labeled %s=%s; drain stopped", m.Spec.NodeName, v1alpha1.LabelAlwaysOn, v1alpha1.LabelAlwaysOnValue))
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("return machine %q to Ready after refused drain: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainRefused,
+		"stopped draining Node %q: it is labeled %s=%s and must never be powered off; back to Ready",
+		m.Spec.NodeName, v1alpha1.LabelAlwaysOn, v1alpha1.LabelAlwaysOnValue)
+	return ctrl.Result{}, nil
 }
 
 // reconcileShuttingDown finalizes the power-off leg. The shutdown-agent issues
@@ -753,6 +785,11 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 	}
 	for k, v := range m.Spec.Labels {
 		desiredLabels[k] = v
+	}
+	if dropped := dropReservedLabels(desiredLabels); len(dropped) > 0 {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonReservedLabel,
+			"not applying label(s) %s to Node %q: reserved for operators, ONP never writes them",
+			strings.Join(dropped, ", "), m.Spec.NodeName)
 	}
 	var desiredTaints []corev1.Taint
 	if pool != nil {

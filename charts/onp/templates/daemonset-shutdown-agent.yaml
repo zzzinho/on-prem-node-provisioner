@@ -28,6 +28,17 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # Structural, not a value: an always-on node never runs the agent, whatever
+      # other labels it carries. The DaemonSet controller also removes the pod if
+      # the label is added later, so a mistaken power-off cannot land there.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: onp.io/always-on
+                operator: NotIn
+                values: ["true"]
       {{- with .Values.shutdownAgent.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

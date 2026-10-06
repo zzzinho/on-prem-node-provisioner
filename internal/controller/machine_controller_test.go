@@ -314,6 +314,32 @@ func onpCordonedReadyNode(name string) *corev1.Node {
 // TestReconcileBootingUncordonsONPCordonedNode: a node ONP cordoned during a
 // prior scale-down is uncordoned (and the marker cleared) when it is woken back
 // to Ready, so it can host pods again.
+// TestReconcileBootingKeepsReservedLabel: a Machine label cannot write the
+// operator-only always-on label onto the Node — the Node keeps its own value, the
+// other labels still apply, and a ReservedLabel Event names the dropped key.
+func TestReconcileBootingKeepsReservedLabel(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	m.Spec.Labels = map[string]string{v1alpha1.LabelAlwaysOn: "false", "team": "a"}
+	node := readyNode("node-a")
+	node.Labels = map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue}
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	labels := f.getNode(t, "node-a").Labels
+	if labels[v1alpha1.LabelAlwaysOn] != v1alpha1.LabelAlwaysOnValue {
+		t.Errorf("always-on label = %q, want the operator's %q kept", labels[v1alpha1.LabelAlwaysOn], v1alpha1.LabelAlwaysOnValue)
+	}
+	if labels["team"] != "a" {
+		t.Errorf("team label = %q, want %q applied", labels["team"], "a")
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonReservedLabel)
+}
+
 func TestReconcileBootingUncordonsONPCordonedNode(t *testing.T) {
 	t.Parallel()
 
@@ -765,6 +791,37 @@ func TestReconcileDrainingWaitsForTerminatingPod(t *testing.T) {
 	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateShuttingDown {
 		t.Errorf("state = %q, want %q once the pod is gone", got, v1alpha1.MachineStateShuttingDown)
 	}
+}
+
+// TestReconcileDrainingAbortsOnAlwaysOnNode: an always-on label that appears
+// while a drain runs stops it — no eviction, the ONP cordon lifted, the Machine
+// back to Ready — so the node is never handed to the power-off leg.
+func TestReconcileDrainingAbortsOnAlwaysOnNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	node := onpCordonedReadyNode("node-a")
+	node.Labels = map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue}
+	f := newFixture(t, m, node, normalPod("app-1", "node-a"))
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none on an always-on node", f.evicted)
+	}
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateReady)
+	}
+	if got.Status.DrainStartTime != nil {
+		t.Error("DrainStartTime kept, want cleared")
+	}
+	if f.getNode(t, "node-a").Spec.Unschedulable {
+		t.Error("node still cordoned, want the ONP cordon lifted")
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonDrainRefused)
 }
 
 func TestReconcileDrainingTimesOutUncordonsAndFails(t *testing.T) {
