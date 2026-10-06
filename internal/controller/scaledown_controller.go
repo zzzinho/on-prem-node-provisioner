@@ -459,9 +459,10 @@ func (r *ScaleDownReconciler) machinesForPod(ctx context.Context, obj client.Obj
 // podEmptinessPredicate admits only Pod events that change whether the pod makes
 // its node non-empty, so the scale-down queue is not woken by routine status
 // heartbeats. A created/deleted scheduled pod flips emptiness; an update matters
-// only when the pod's evictability changes (it reached a terminal phase). A pod
-// that starts terminating still occupies its node, so its final delete — not the
-// deletionTimestamp update — is what frees the node.
+// when the pod is bound to a node (a pod created unscheduled reaches its node by
+// this update, never by a create) or when its evictability changes (it reached a
+// terminal phase). A pod that starts terminating still occupies its node, so its
+// final delete — not the deletionTimestamp update — is what frees the node.
 func podEmptinessPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
@@ -477,6 +478,9 @@ func podEmptinessPredicate() predicate.Predicate {
 			newPod, ok2 := e.ObjectNew.(*corev1.Pod)
 			if !ok1 || !ok2 || newPod.Spec.NodeName == "" {
 				return false
+			}
+			if oldPod.Spec.NodeName != newPod.Spec.NodeName {
+				return isWorkload(newPod)
 			}
 			return isWorkload(oldPod) != isWorkload(newPod)
 		},

@@ -13,6 +13,7 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
@@ -547,5 +548,32 @@ func TestScaleDownMachinesForPod(t *testing.T) {
 	// An unscheduled pod (no NodeName) maps to nothing.
 	if reqs := r.machinesForPod(context.Background(), sdPod("app", "", "")); len(reqs) != 0 {
 		t.Fatalf("machinesForPod(unscheduled) = %v, want none", reqs)
+	}
+}
+
+// TestPodEmptinessPredicateUpdate: an update wakes scale-down only when it can
+// change the node's emptiness — a workload pod being bound to the node, or a pod
+// reaching a terminal phase — and not on routine status heartbeats.
+func TestPodEmptinessPredicateUpdate(t *testing.T) {
+	succeeded := sdPod("app", "node-a", "")
+	succeeded.Status.Phase = corev1.PodSucceeded
+
+	tests := []struct {
+		name     string
+		old, new *corev1.Pod
+		want     bool
+	}{
+		{"workload pod bound to node", sdPod("app", "", ""), sdPod("app", "node-a", ""), true},
+		{"daemonset pod bound to node", sdPod("ds", "", "DaemonSet"), sdPod("ds", "node-a", "DaemonSet"), false},
+		{"heartbeat on a bound pod", sdPod("app", "node-a", ""), sdPod("app", "node-a", ""), false},
+		{"pod reached terminal phase", sdPod("app", "node-a", ""), succeeded, true},
+	}
+	pred := podEmptinessPredicate()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pred.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
+				t.Errorf("Update() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
