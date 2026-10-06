@@ -75,6 +75,7 @@ const (
 	reasonDuplicateNode    = "DuplicateNode"
 	reasonReservedLabel    = "ReservedLabel"
 	reasonTemplateRejected = "TemplateRejected"
+	reasonAdopted          = "Adopted"
 )
 
 // duplicateNodeRecheck is how often a Machine held because another Machine
@@ -214,6 +215,19 @@ func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machin
 	// must not re-drain the node the moment it is next woken to Ready.
 	if err := r.removeDrainAnnotation(ctx, m); err != nil {
 		return ctrl.Result{}, err
+	}
+	// A Node that is up while its Machine reads Off — back after a node loss,
+	// powered on by hand, or a Machine created over a running node — is adopted as
+	// it is: no power-on, straight to Ready, so a running host is never reported
+	// (and left) as off.
+	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
+	}
+	if ready {
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonAdopted,
+			"Node %q is already Ready; adopting it without a power-on", m.Spec.NodeName)
+		return r.promoteToReady(ctx, m)
 	}
 	if !wakeRequested(m) {
 		return ctrl.Result{}, nil

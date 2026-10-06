@@ -416,6 +416,31 @@ func TestReconcileBootingTimesOutFails(t *testing.T) {
 	}
 }
 
+// TestReconcileOffAdoptsReadyNode: a Machine that reads Off while its Node is
+// Ready (back from a node loss, powered on by hand, or created over a running
+// node) is adopted straight into Ready — no power-on — and the Node gets its
+// template.
+func TestReconcileOffAdoptsReadyNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateOff, nil)
+	m.Spec.Labels = map[string]string{"team": "a"}
+	f := newFixture(t, m, readyNode("node-a"))
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want %q", got, v1alpha1.MachineStateReady)
+	}
+	if f.provider.powerOnCalls != 0 {
+		t.Errorf("PowerOn calls = %d, want 0 for a node that is already up", f.provider.powerOnCalls)
+	}
+	if got := f.getNode(t, "node-a").Labels["team"]; got != "a" {
+		t.Errorf("team label = %q, want the template applied", got)
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonAdopted)
+}
+
 func TestReconcileOffPowerOnErrorStaysOff(t *testing.T) {
 	t.Parallel()
 
