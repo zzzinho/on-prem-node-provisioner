@@ -602,20 +602,26 @@ func (r *MachineReconciler) abortDrain(ctx context.Context, m *v1alpha1.Machine)
 // Until then we keep polling, because the Node going NotReady is the only signal
 // that the node actually went down.
 func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
+	var issuedAt time.Time
+	if m.Status.ShutdownStartTime != nil {
+		issuedAt = m.Status.ShutdownStartTime.Time
 	}
-	if ready {
-		// Poweroff not observed yet. If the node has not gone down within the
-		// shutdown budget the power-off did not land (the agent never ran, or the
-		// board powered itself back on) — fail rather than poll forever. The node is
+	down, err := nodeWentDownSince(ctx, r.Client, m.Spec.NodeName, issuedAt)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !down {
+		// Power-off not observed yet: the node is still Ready, or it was already
+		// NotReady before the power-off was issued, which proves nothing. If it has
+		// not gone down within the shutdown budget the power-off did not land (the
+		// agent never ran, the board powered itself back on, or the node is cut off
+		// while still running) — fail rather than poll forever or guess. The node is
 		// left cordoned for the operator to inspect.
 		if r.shutdownTimedOut(m) {
 			m.Status.State = v1alpha1.MachineStateFailed
 			m.Status.ShutdownStartTime = nil
 			setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonShutdownTimeout,
-				fmt.Sprintf("Node %q still Ready %s after power-off was issued", m.Spec.NodeName, r.ShutdownTimeout))
+				fmt.Sprintf("Node %q not seen going NotReady within %s after power-off was issued", m.Spec.NodeName, r.ShutdownTimeout))
 			if err := r.Status().Update(ctx, m); err != nil {
 				return ctrl.Result{}, fmt.Errorf("fail machine %q on shutdown timeout: %w", m.Name, err)
 			}

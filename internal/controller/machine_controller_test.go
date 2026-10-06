@@ -488,6 +488,60 @@ func TestReconcileShuttingDownNodeStillReadyKeepsPolling(t *testing.T) {
 // TestReconcileShuttingDownTimesOutFails (A1): a node that never goes NotReady
 // after power-off must not poll forever — once the shutdown budget elapses the
 // Machine is failed.
+// notReadyNodeSince returns a Node whose Ready condition turned False at at.
+func notReadyNodeSince(name string, at time.Time) *corev1.Node {
+	n := notReadyNode(name)
+	n.Status.Conditions[0].LastTransitionTime = metav1.NewTime(at)
+	return n
+}
+
+// TestReconcileShuttingDownOffOnceNodeGoesDown: a Node that turns NotReady after
+// the power-off was issued is the evidence it landed — the Machine goes Off.
+func TestReconcileShuttingDownOffOnceNodeGoesDown(t *testing.T) {
+	t.Parallel()
+
+	issued := time.Now().Truncate(time.Second)
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	m.Status.ShutdownStartTime = &metav1.Time{Time: issued}
+	f := newFixture(t, m, notReadyNodeSince("node-a", issued.Add(40*time.Second)))
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateOff {
+		t.Errorf("state = %q, want %q", got, v1alpha1.MachineStateOff)
+	}
+}
+
+// TestReconcileShuttingDownIgnoresEarlierNotReady: a Node that was already
+// NotReady before the power-off was issued (cut off while running) does not prove
+// the power-off landed — the Machine keeps waiting and fails at the shutdown
+// timeout instead of reporting a power-off that may not have happened.
+func TestReconcileShuttingDownIgnoresEarlierNotReady(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	f := newFixture(t, m, notReadyNodeSince("node-a", time.Now().Add(-time.Minute)))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.ShutdownStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed ShutdownStartTime: %v", err)
+	}
+
+	res := f.reconcile(t)
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateShuttingDown {
+		t.Fatalf("state = %q, want %q while the power-off is unconfirmed", got, v1alpha1.MachineStateShuttingDown)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("RequeueAfter = 0, want a poll while waiting")
+	}
+
+	f.clock.Step(6 * time.Minute)
+	f.reconcile(t)
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateFailed {
+		t.Errorf("state = %q, want %q at the shutdown timeout", got, v1alpha1.MachineStateFailed)
+	}
+}
+
 func TestReconcileShuttingDownTimesOutFails(t *testing.T) {
 	t.Parallel()
 
