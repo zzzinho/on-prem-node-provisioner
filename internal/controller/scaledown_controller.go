@@ -65,6 +65,12 @@ type ScaleDownReconciler struct {
 	// tests can drive it with a fake clock. A PassiveClock is enough — the timer is
 	// evaluated each reconcile against status.emptySince, not scheduled.
 	Clock clock.PassiveClock
+	// APIReader reads straight from the API server, bypassing the informer cache.
+	// The pool guards (cooldown, minNodes, maxConcurrent) are evaluated through it:
+	// two Machines of a pool triggered back to back must see each other's drain-now
+	// and the fresh cooldown anchor, and the cache may not yet reflect a write made
+	// a moment earlier. main.go wires mgr.GetAPIReader().
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
@@ -192,6 +198,18 @@ func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.Machine, pool *v1alpha1.NodePool, after time.Duration) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// The guards below decide whether a node may power off, so they run on fresh
+	// state rather than the cache the rest of this reconcile used.
+	pool, members, err := r.freshPoolState(ctx, pool)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if self := memberNamed(members, m.Name); self == nil || self.Status.State != v1alpha1.MachineStateReady || drainRequested(self) {
+		// The cache was behind: this Machine already left Ready, left the pool, or was
+		// already asked to drain. Its own watch event will bring it back if needed.
+		return ctrl.Result{}, nil
+	}
+
 	// cooldown.scaleDown: rate-limit power-off decisions across the pool, mirroring
 	// cooldown.scaleUp. Requeue exactly when the interval lifts.
 	if until := r.coolingDownUntil(pool); !until.IsZero() {
@@ -203,10 +221,6 @@ func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.
 		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
-	members, err := r.poolMembers(ctx, pool)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	keptOn, scalingDown := poolScaleDownCounts(members)
 
 	// minNodes floor: never drain a node that would drop the pool's kept-on count
@@ -340,19 +354,34 @@ func consolidateAfter(pool *v1alpha1.NodePool) (time.Duration, bool) {
 	return ca.Duration, true
 }
 
-// poolMembers lists the Machines matching the pool's machineSelector. The scale-
-// down guards count over this set. It mirrors the selector logic the scale-up and
-// nodepool reconcilers use.
-func (r *ScaleDownReconciler) poolMembers(ctx context.Context, pool *v1alpha1.NodePool) ([]v1alpha1.Machine, error) {
-	selector, err := metav1.LabelSelectorAsSelector(&pool.Spec.MachineSelector)
+// freshPoolState re-reads the pool and its members (the Machines matching its
+// machineSelector) through APIReader, the inputs every scale-down guard counts
+// over. The selector comes from the pool as given; status — the cooldown anchor —
+// and membership come fresh.
+func (r *ScaleDownReconciler) freshPoolState(ctx context.Context, pool *v1alpha1.NodePool) (*v1alpha1.NodePool, []v1alpha1.Machine, error) {
+	var fresh v1alpha1.NodePool
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: pool.Name}, &fresh); err != nil {
+		return nil, nil, fmt.Errorf("get nodepool %q: %w", pool.Name, err)
+	}
+	selector, err := metav1.LabelSelectorAsSelector(&fresh.Spec.MachineSelector)
 	if err != nil {
-		return nil, fmt.Errorf("convert machineSelector for nodepool %q: %w", pool.Name, err)
+		return nil, nil, fmt.Errorf("convert machineSelector for nodepool %q: %w", fresh.Name, err)
 	}
 	var machines v1alpha1.MachineList
-	if err := r.List(ctx, &machines, client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return nil, fmt.Errorf("list machines for pool %q: %w", pool.Name, err)
+	if err := r.APIReader.List(ctx, &machines, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, nil, fmt.Errorf("list machines for pool %q: %w", fresh.Name, err)
 	}
-	return machines.Items, nil
+	return &fresh, machines.Items, nil
+}
+
+// memberNamed returns the member with the given name, or nil.
+func memberNamed(members []v1alpha1.Machine, name string) *v1alpha1.Machine {
+	for i := range members {
+		if members[i].Name == name {
+			return &members[i]
+		}
+	}
+	return nil
 }
 
 // poolScaleDownCounts splits a pool's members into those kept powered on (active

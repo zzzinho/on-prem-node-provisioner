@@ -80,9 +80,18 @@ func sdPod(name, node, kind string) *corev1.Pod {
 
 func newScaleDownReconciler(t *testing.T, rec record.EventRecorder, clk *clocktesting.FakePassiveClock, objs ...client.Object) (*ScaleDownReconciler, client.Client) {
 	t.Helper()
-	scheme := newScheme(t)
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
+	cl := sdFakeClient(t, objs...)
+	// One fake client stands in for both the cache and the API server; a test
+	// that needs them to disagree swaps APIReader for a second client.
+	return &ScaleDownReconciler{Client: cl, Scheme: cl.Scheme(), Recorder: rec, Clock: clk, APIReader: cl}, cl
+}
+
+// sdFakeClient builds a fake client with the indexes and status subresources the
+// scale-down path relies on.
+func sdFakeClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
 		WithStatusSubresource(&v1alpha1.Machine{}, &v1alpha1.NodePool{}).
 		WithIndex(&corev1.Pod{}, IndexPodNodeName, func(o client.Object) []string {
 			pod, ok := o.(*corev1.Pod)
@@ -100,7 +109,6 @@ func newScaleDownReconciler(t *testing.T, rec record.EventRecorder, clk *clockte
 		}).
 		WithObjects(objs...).
 		Build()
-	return &ScaleDownReconciler{Client: cl, Scheme: scheme, Recorder: rec, Clock: clk}, cl
 }
 
 // reconcileSD reconciles the named Machine once.
@@ -576,4 +584,31 @@ func TestPodEmptinessPredicateUpdate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestScaleDownGuardsUseFreshState: the pool guards read through APIReader, so a
+// drain another member was just given counts even when the cache has not caught
+// up — maxConcurrent holds instead of letting a second back-to-back drain through.
+func TestScaleDownGuardsUseFreshState(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	a := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	b := sdMachine("node-b", v1alpha1.MachineStateReady, nil)
+	pool := whenEmptyPool("edge", &after) // minNodes 0, maxConcurrent 1
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	rec := record.NewFakeRecorder(8)
+
+	// The API server already holds node-b's drain-now; the cache does not.
+	bDraining := b.DeepCopy()
+	bDraining.Annotations = map[string]string{v1alpha1.AnnotationDrainNow: v1alpha1.AnnotationDrainNowValue}
+	api := sdFakeClient(t, a.DeepCopy(), bDraining, pool.DeepCopy())
+	r, cl := newScaleDownReconciler(t, rec, clk, a, b, pool)
+	r.APIReader = api
+
+	reconcileSD(t, r, "node-a")
+
+	if drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("node-a drained although node-b's drain already fills maxConcurrent")
+	}
+	assertEvent(t, rec, reasonScaleDownBlocked)
 }

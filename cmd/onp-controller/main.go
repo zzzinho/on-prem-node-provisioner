@@ -173,10 +173,11 @@ func main() {
 	}
 
 	if err := (&controller.ScaleDownReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("onp-controller"),
-		Clock:    clock.RealClock{},
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("onp-controller"),
+		Clock:     clock.RealClock{},
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up scale-down reconciler")
 		os.Exit(1)
