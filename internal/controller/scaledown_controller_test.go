@@ -681,3 +681,43 @@ func TestScaleDownMembersOfPool(t *testing.T) {
 		t.Fatalf("membersOfPool = %v, want one request for node-a", reqs)
 	}
 }
+
+// TestScaleDownAnnouncesHoldOnce: a hold re-checked every requeue is announced
+// once, not on every pass — so it cannot exhaust the Machine's Event budget —
+// and announced again once it has lifted and come back.
+func TestScaleDownAnnouncesHoldOnce(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.MinNodes = 1
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	rec := record.NewFakeRecorder(16)
+	r, cl := newScaleDownReconciler(t, rec, clk, m, pool)
+
+	for range 3 {
+		reconcileSD(t, r, "node-a")
+	}
+	if got := len(rec.Events); got != 1 {
+		t.Fatalf("events after three held passes = %d, want 1", got)
+	}
+	<-rec.Events
+
+	// The hold lifts (the Machine leaves Ready), then comes back.
+	setSDState := func(state v1alpha1.MachineState) {
+		got := getSDMachine(t, cl, "node-a")
+		got.Status.State = state
+		got.Status.EmptySince = &metav1.Time{Time: empty}
+		if err := cl.Status().Update(context.Background(), got); err != nil {
+			t.Fatalf("set state %s: %v", state, err)
+		}
+	}
+	setSDState(v1alpha1.MachineStateBooting)
+	reconcileSD(t, r, "node-a")
+	setSDState(v1alpha1.MachineStateReady)
+	reconcileSD(t, r, "node-a")
+
+	if got := len(rec.Events); got != 1 {
+		t.Errorf("events after the hold came back = %d, want 1 new announcement", got)
+	}
+}
