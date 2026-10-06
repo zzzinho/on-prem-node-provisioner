@@ -384,11 +384,13 @@ func memberNamed(members []v1alpha1.Machine, name string) *v1alpha1.Machine {
 	return nil
 }
 
-// poolScaleDownCounts splits a pool's members into those kept powered on (active
-// and not already being retired) and those already scaling down. keptOn anchors
-// the minNodes floor; scalingDown anchors the maxConcurrent cap. A member already
-// on its way down is counted in scalingDown only, never keptOn, so it neither
-// props up the floor nor is double-counted.
+// poolScaleDownCounts splits a pool's members into those kept powered on and
+// those already scaling down. keptOn anchors the minNodes floor; scalingDown
+// anchors the maxConcurrent cap. Only a Ready member keeps the floor: a Booting
+// one (or an Off one asked to wake) may never come up — a lost WoL packet, a
+// boot that times out — and counting it would let the floor's last Ready node
+// drain on a promise. A member already on its way down is counted in scalingDown
+// only, so it neither props up the floor nor is double-counted.
 func poolScaleDownCounts(members []v1alpha1.Machine) (keptOn, scalingDown int32) {
 	for i := range members {
 		m := &members[i]
@@ -396,7 +398,7 @@ func poolScaleDownCounts(members []v1alpha1.Machine) (keptOn, scalingDown int32)
 			scalingDown++
 			continue
 		}
-		if isActive(m) {
+		if m.Status.State == v1alpha1.MachineStateReady {
 			keptOn++
 		}
 	}
@@ -459,6 +461,20 @@ func (r *ScaleDownReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.machinesForPod),
 			builder.WithPredicates(podEmptinessPredicate()),
 		).
+		// A pool's spec — its policy, consolidateAfter, membership — decides whether
+		// its members are scale-down candidates at all; re-evaluate them when it
+		// changes, not on every status write.
+		Watches(
+			&v1alpha1.NodePool{},
+			handler.EnqueueRequestsFromMapFunc(r.membersOfPool),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
+		// The Node exemptions gate the empty timer; lifting one must start it.
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.machinesForNode),
+			builder.WithPredicates(nodeExemptionChanged()),
+		).
 		Named("scaledown").
 		Complete(r)
 }
@@ -468,21 +484,48 @@ func (r *ScaleDownReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // NodeName) maps to nothing.
 func (r *ScaleDownReconciler) machinesForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	pod, ok := obj.(*corev1.Pod)
-	if !ok || pod.Spec.NodeName == "" {
+	if !ok {
 		return nil
 	}
-	var machines v1alpha1.MachineList
-	if err := r.List(ctx, &machines, client.MatchingFields{IndexMachineNodeName: pod.Spec.NodeName}); err != nil {
-		log.FromContext(ctx).Error(err, "list machines for pod", "pod", pod.Namespace+"/"+pod.Name, "node", pod.Spec.NodeName)
+	return requestsForMachinesOnNode(ctx, r.Client, pod.Spec.NodeName)
+}
+
+// machinesForNode maps a Node event to the Machines backed by that Node.
+func (r *ScaleDownReconciler) machinesForNode(ctx context.Context, obj client.Object) []reconcile.Request {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
 		return nil
 	}
-	requests := make([]reconcile.Request, 0, len(machines.Items))
-	for i := range machines.Items {
-		requests = append(requests, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: machines.Items[i].Name},
-		})
+	return requestsForMachinesOnNode(ctx, r.Client, node.Name)
+}
+
+// membersOfPool maps a NodePool event to the Machines its selector matches.
+func (r *ScaleDownReconciler) membersOfPool(ctx context.Context, obj client.Object) []reconcile.Request {
+	pool, ok := obj.(*v1alpha1.NodePool)
+	if !ok {
+		return nil
 	}
-	return requests
+	return requestsForPoolMembers(ctx, r.Client, pool)
+}
+
+// nodeExemptionChanged admits only the Node updates that flip a scale-down
+// exemption — the do-not-disrupt annotation or the always-on label — so the
+// queue is not woken by every kubelet status write.
+func nodeExemptionChanged() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return false },
+		DeleteFunc: func(event.DeleteEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, ok1 := e.ObjectOld.(*corev1.Node)
+			newNode, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return false
+			}
+			return oldNode.Annotations[v1alpha1.AnnotationDoNotDisrupt] != newNode.Annotations[v1alpha1.AnnotationDoNotDisrupt] ||
+				oldNode.Labels[v1alpha1.LabelAlwaysOn] != newNode.Labels[v1alpha1.LabelAlwaysOn]
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
 }
 
 // podEmptinessPredicate admits only Pod events that change whether the pod makes

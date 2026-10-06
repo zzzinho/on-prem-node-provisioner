@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,6 +32,16 @@ const scaleUpRequeue = 30 * time.Second
 // noFitRequeue is the slower re-check for a pod that nothing currently fits, so
 // a Machine added or relabelled later is reconsidered without a Warning storm.
 const noFitRequeue = 60 * time.Second
+
+// readySettle is how long after reaching Ready a fitting Machine still counts as
+// a wake in flight. A just-woken node often cannot take its pod yet — the GPU
+// device plugin registers after the kubelet goes Ready — and without the window
+// the pod's next reconcile would wake another Machine for it.
+//
+// ponytail: a fixed window. A pod blocked for longer by something fit does not
+// model wakes the next Machine after it; the fit-fidelity work (pod volumes, real
+// Node labels and taints) is the upgrade path.
+const readySettle = 2 * time.Minute
 
 // minCooldownRequeue floors the requeue we compute from a pool's cooldown
 // expiry, so a near-zero remaining interval still yields a real wait rather than
@@ -92,6 +103,10 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.List(ctx, &pools); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list nodepools: %w", err)
 	}
+	memberships, err := poolMemberships(ctx, r.Client, pools.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Walk every pool's members, fit-checking each against a synthetic Node that
 	// describes how the Machine will look once Ready. We track, across all pools:
@@ -127,7 +142,10 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Per-pool guards, computed once over the membership: a pool at its
 		// maxNodes cap cannot wake any member; a pool still inside its
 		// cooldown.scaleUp window cannot wake another member until it lifts.
-		maxed := poolAtCap(pool, machines.Items)
+		maxed, err := r.poolAtCap(ctx, pool, machines.Items)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		poolCoolingUntil := r.coolingUntil(pool)
 
 		for j := range machines.Items {
@@ -136,11 +154,19 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if !scheduler.Fit(&pod, node).Fits {
 				continue
 			}
-			if isWaking(m) {
+			if isWaking(m) || r.settling(m) {
 				wakeInFlight = true
 				continue
 			}
-			if m.Status.State != v1alpha1.MachineStateOff {
+			// Only an Off Machine not yet asked to wake is a candidate; one whose
+			// power-on keeps failing already carries the request.
+			if m.Status.State != v1alpha1.MachineStateOff || wakeRequested(m) {
+				continue
+			}
+			// A Machine in more than one pool has no single policy to wake it under
+			// (whose maxNodes, whose template?); hold it until the overlap is fixed.
+			if memberships[m.Name] > 1 {
+				logger.V(1).Info("skip machine matching several pools", "machine", m.Name)
 				continue
 			}
 			// A fitting Off member, but the pool's guards may forbid waking it.
@@ -303,20 +329,57 @@ func smallestCandidate(candidates []wakeCandidate) wakeCandidate {
 	return candidates[0]
 }
 
+// poolMemberships counts, per Machine name, how many of pools select it.
+func poolMemberships(ctx context.Context, c client.Client, pools []v1alpha1.NodePool) (map[string]int, error) {
+	counts := map[string]int{}
+	for i := range pools {
+		selector, err := metav1.LabelSelectorAsSelector(&pools[i].Spec.MachineSelector)
+		if err != nil {
+			continue
+		}
+		var machines v1alpha1.MachineList
+		if err := c.List(ctx, &machines, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+			return nil, fmt.Errorf("list machines for pool %q: %w", pools[i].Name, err)
+		}
+		for j := range machines.Items {
+			counts[machines.Items[j].Name]++
+		}
+	}
+	return counts, nil
+}
+
 // poolAtCap reports whether waking another member of this pool would exceed its
-// maxNodes. A nil MaxNodes is unbounded. The count is the pool's active members:
-// those powered on, transitioning while on, or about to power on (see isActive).
-func poolAtCap(pool *v1alpha1.NodePool, members []v1alpha1.Machine) bool {
+// maxNodes. A nil MaxNodes is unbounded. The count is the members that take a
+// slot (see countsAgainstCap).
+func (r *ScaleUpReconciler) poolAtCap(ctx context.Context, pool *v1alpha1.NodePool, members []v1alpha1.Machine) (bool, error) {
 	if pool.Spec.MaxNodes == nil {
-		return false
+		return false, nil
 	}
 	var active int32
 	for i := range members {
-		if isActive(&members[i]) {
+		counts, err := r.countsAgainstCap(ctx, &members[i])
+		if err != nil {
+			return false, err
+		}
+		if counts {
 			active++
 		}
 	}
-	return active >= *pool.Spec.MaxNodes
+	return active >= *pool.Spec.MaxNodes, nil
+}
+
+// countsAgainstCap reports whether a member takes a maxNodes slot: it is active
+// (isActive), or it is Failed while its Node is still up — a drain that timed out
+// leaves the node uncordoned and serving, a power-off that never landed leaves it
+// running — so it is a powered-on node the cap must see.
+func (r *ScaleUpReconciler) countsAgainstCap(ctx context.Context, m *v1alpha1.Machine) (bool, error) {
+	if isActive(m) {
+		return true, nil
+	}
+	if m.Status.State != v1alpha1.MachineStateFailed {
+		return false, nil
+	}
+	return nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 }
 
 // isActive reports whether a Machine counts against its pool's maxNodes cap: it
@@ -365,6 +428,16 @@ func memBytes(m *v1alpha1.Machine) *resource.Quantity {
 	return &q
 }
 
+// settling reports whether a Machine reached Ready within readySettle — woken,
+// most likely for this very pod, and not yet able to take it.
+func (r *ScaleUpReconciler) settling(m *v1alpha1.Machine) bool {
+	if m.Status.State != v1alpha1.MachineStateReady {
+		return false
+	}
+	c := meta.FindStatusCondition(m.Status.Conditions, v1alpha1.ConditionReady)
+	return c != nil && c.Status == metav1.ConditionTrue && r.Clock.Since(c.LastTransitionTime.Time) < readySettle
+}
+
 // isWaking reports whether a Machine already has a wake in progress that will
 // satisfy a pending pod: it is Booting, or it is Off with the wake-now trigger
 // already set (the MachineReconciler has not yet advanced it to Booting).
@@ -372,7 +445,13 @@ func isWaking(m *v1alpha1.Machine) bool {
 	if m.Status.State == v1alpha1.MachineStateBooting {
 		return true
 	}
-	return m.Status.State == v1alpha1.MachineStateOff && wakeRequested(m)
+	if m.Status.State != v1alpha1.MachineStateOff || !wakeRequested(m) {
+		return false
+	}
+	// A wake whose last power-on failed is not in flight: the controller keeps
+	// retrying it, but the pod may be served by another Machine meanwhile.
+	c := meta.FindStatusCondition(m.Status.Conditions, v1alpha1.ConditionPowerOnSucceeded)
+	return c == nil || c.Status != metav1.ConditionFalse
 }
 
 // isScaleUpCandidate reports whether a Pod needs a node woken for it: it is

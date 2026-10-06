@@ -244,6 +244,19 @@
 - **업그레이드**: Machine CRD 가 바뀌었으므로 `kubectl apply -f charts/onp/crds/` 후 `helm upgrade` (Helm 은 crds/ 를 업그레이드하지 않음).
 - [x] **검증** — 실클러스터 배포 (2026-10-06, CRD apply → `helm upgrade` 0.6.2→0.6.3). `desktop` Machine 의 nodeName 변경 dry-run 이 `nodeName is immutable` 로 거부됨, shutdown-agent DaemonSet 에 always-on 제외 affinity 반영, 세 컴포넌트 0.6.3 Running·에러 로그 없음. 각 수정은 단위 테스트로 커버(수정을 되돌리면 해당 테스트가 실패함을 확인). 전원 사이클로 하는 실하드웨어 확인은 하지 않음.
 
+### M5.10 — 상태 고착·잘못된 상태 수정 (차트 0.6.4)
+
+**왜**: 전수 점검(M5.9)의 두 번째 그룹. 사람이 손대기 전까지 Machine 이 잘못된 상태에 머물거나, 실제와 다른 상태를 보고하던 경로.
+
+- [x] **template 거절 시 Booting 고착** — Ready 전환을 `promoteToReady`, 실패를 `failBoot` 로 분리. API 가 template 을 Invalid 로 거절하면 `TemplateRejected` 로 Failed, 그 밖의 오류도 boot-timeout 이 지나면 Failed. taint 는 key+effect 로 병합(`mergeTaint`)해 값 변경이 중복 taint 로 거절되지 않음.
+- [x] **Off 인데 노드가 켜짐** — 전원 명령 없이 `Ready` 로 편입(`Adopted`). 이미 켜진 노드에 Machine 을 만들 때 wake-now 가 더는 필요 없음.
+- [x] **wake 요청 잔존** — boot 실패 시 wake-now 제거. power-on 이 실패 중인 Off Machine 은 in-flight 로 보지 않아 다른 Machine 이 파드를 받을 수 있음.
+- [x] **연쇄 wake** — Ready 후 `readySettle`(2분) 안의 fit Machine 은 in-flight 로 본다.
+- [x] **minNodes / maxNodes 집계** — 하한은 Ready 만, 상한은 Node 가 켜져 있는 Failed 도 센다.
+- [x] **scale-down watch** — NodePool spec 변경·Node 예외(do-not-disrupt, always-on) 변경에 반응. 공용 매퍼는 `mapping.go`.
+- [x] **풀 충돌** — 정렬로 결정적, drain 은 force 없이 최단 timeout, template 은 Machine 라벨만, scale-up 후보에서 제외.
+- [x] **검증** — 실클러스터 배포 (2026-10-06, `helm upgrade` 0.6.3→0.6.4, CRD 무변). 세 컴포넌트 0.6.4 Running, `desktop` Ready 유지, 에러 로그 없음. 각 수정은 단위 테스트로 커버(되돌리면 해당 테스트 실패 확인).
+
 ---
 
 ## Phase 2 — 운영성

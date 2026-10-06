@@ -18,6 +18,7 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
@@ -412,6 +413,59 @@ func TestReconcileBootingTimesOutFails(t *testing.T) {
 	got := f.getMachine(t)
 	if got.Status.State != v1alpha1.MachineStateFailed {
 		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateFailed)
+	}
+}
+
+// TestReconcileOffAdoptsReadyNode: a Machine that reads Off while its Node is
+// Ready (back from a node loss, powered on by hand, or created over a running
+// node) is adopted straight into Ready — no power-on — and the Node gets its
+// template.
+func TestReconcileOffAdoptsReadyNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateOff, nil)
+	m.Spec.Labels = map[string]string{"team": "a"}
+	f := newFixture(t, m, readyNode("node-a"))
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want %q", got, v1alpha1.MachineStateReady)
+	}
+	if f.provider.powerOnCalls != 0 {
+		t.Errorf("PowerOn calls = %d, want 0 for a node that is already up", f.provider.powerOnCalls)
+	}
+	if got := f.getNode(t, "node-a").Labels["team"]; got != "a" {
+		t.Errorf("team label = %q, want the template applied", got)
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonAdopted)
+}
+
+// TestReconcileBootTimeoutClearsWakeNow: a boot that times out spends its wake
+// request, so an operator returning the Failed Machine to Off does not power the
+// node straight back on.
+func TestReconcileBootTimeoutClearsWakeNow(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	f := newFixture(t, m, notReadyNode("node-a"))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.BootStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed BootStartTime: %v", err)
+	}
+	f.clock.Step(11 * time.Minute)
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateFailed {
+		t.Fatalf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateFailed)
+	}
+	if _, ok := got.Annotations[v1alpha1.AnnotationWakeNow]; ok {
+		t.Error("wake-now kept on a Failed Machine, want removed")
 	}
 }
 
@@ -1246,7 +1300,7 @@ func TestReconcileBootingAppliesNodeTemplate(t *testing.T) {
 	if n.Labels["disk"] != "ssd" {
 		t.Errorf("node label disk = %q, want ssd (machine label overrides template)", n.Labels["disk"])
 	}
-	if !hasTaint(n.Spec.Taints, corev1.Taint{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}) {
+	if !containsTaint(n.Spec.Taints, corev1.Taint{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}) {
 		t.Errorf("node taints = %v, want template taint applied", n.Spec.Taints)
 	}
 }
@@ -1317,4 +1371,146 @@ func hasEvent(events []string, reason string) bool {
 // literal is malformed (it never is at call sites).
 func resourceQty(s string) resource.Quantity {
 	return resource.MustParse(s)
+}
+
+// containsTaint reports whether taints has an entry equal to t.
+func containsTaint(taints []corev1.Taint, t corev1.Taint) bool {
+	for _, have := range taints {
+		if have.Key == t.Key && have.Value == t.Value && have.Effect == t.Effect {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMergeTaint(t *testing.T) {
+	t.Parallel()
+
+	ns := corev1.Taint{Key: "onp.io/on-demand", Value: "true", Effect: corev1.TaintEffectPreferNoSchedule}
+	tests := []struct {
+		name        string
+		have        []corev1.Taint
+		add         corev1.Taint
+		want        []corev1.Taint
+		wantChanged bool
+	}{
+		{"absent is appended", nil, ns, []corev1.Taint{ns}, true},
+		{"identical is a no-op", []corev1.Taint{ns}, ns, []corev1.Taint{ns}, false},
+		{
+			"same key and effect replaces the value",
+			[]corev1.Taint{ns},
+			corev1.Taint{Key: ns.Key, Value: "yes", Effect: ns.Effect},
+			[]corev1.Taint{{Key: ns.Key, Value: "yes", Effect: ns.Effect}},
+			true,
+		},
+		{
+			"same key, other effect is a separate taint",
+			[]corev1.Taint{ns},
+			corev1.Taint{Key: ns.Key, Value: "true", Effect: corev1.TaintEffectNoSchedule},
+			[]corev1.Taint{ns, {Key: ns.Key, Value: "true", Effect: corev1.TaintEffectNoSchedule}},
+			true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := mergeTaint(append([]corev1.Taint(nil), tc.have...), tc.add)
+			if changed != tc.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("taints = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("taints[%d] = %v, want %v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestReconcileBootingFailsOnRejectedTemplate: when the API server rejects the
+// template patch as invalid — a configuration error no retry fixes — the Machine
+// fails with TemplateRejected instead of staying Booting forever, where it would
+// hold back every other wake for the same pod.
+func TestReconcileBootingFailsOnRejectedTemplate(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	m.Spec.Labels = map[string]string{"gpu-model": "RTX 3090"}
+	f := newFixture(t, m, readyNode("node-a"))
+	f.r.Client = interceptor.NewClient(f.cl.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, isNode := obj.(*corev1.Node); isNode {
+				return apierrors.NewInvalid(corev1.SchemeGroupVersion.WithKind("Node").GroupKind(), obj.GetName(), nil)
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateFailed {
+		t.Fatalf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateFailed)
+	}
+	if cond := condition(got, v1alpha1.ConditionReady); cond == nil || cond.Reason != reasonTemplateRejected {
+		t.Errorf("Ready condition = %+v, want reason %s", cond, reasonTemplateRejected)
+	}
+}
+
+// TestDrainPolicyConservativeOnPoolConflict: a Machine matching two pools drains
+// under the most conservative reading of both — never force, the shortest
+// budget — whatever order the pools are listed in.
+func TestDrainPolicyConservativeOnPoolConflict(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	m.Labels = map[string]string{"pool": "a", "dup": "yes"}
+	forcing := nodePool("pool-a", map[string]string{"pool": "a"}, ptrInt32(600))
+	forcing.Spec.Drain.Force = true
+	strict := nodePool("pool-b", map[string]string{"dup": "yes"}, ptrInt32(60))
+	f := newFixture(t, m, forcing, strict)
+
+	timeout, force, err := f.r.drainPolicy(context.Background(), m)
+	if err != nil {
+		t.Fatalf("drainPolicy() error: %v", err)
+	}
+	if force {
+		t.Error("force = true, want false when the pools disagree")
+	}
+	if timeout != 60*time.Second {
+		t.Errorf("timeout = %v, want the shortest budget 60s", timeout)
+	}
+}
+
+// TestReconcileBootingSkipsPoolTemplateOnConflict: a Machine matching two pools
+// gets neither pool's template on the Node — only its own labels — and a
+// PoolConflict Event, instead of whichever template the cache listed first.
+func TestReconcileBootingSkipsPoolTemplateOnConflict(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	m.Labels = map[string]string{"pool": "a", "dup": "yes"}
+	m.Spec.Labels = map[string]string{"team": "a"}
+	poolA := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
+	poolA.Spec.Template.Labels = map[string]string{"from": "a"}
+	poolB := nodePool("pool-b", map[string]string{"dup": "yes"}, nil)
+	poolB.Spec.Template.Labels = map[string]string{"from": "b"}
+	f := newFixture(t, m, poolA, poolB, readyNode("node-a"))
+
+	f.reconcile(t)
+
+	labels := f.getNode(t, "node-a").Labels
+	if _, ok := labels["from"]; ok {
+		t.Errorf("pool template label applied (from=%q), want none on conflict", labels["from"])
+	}
+	if labels["team"] != "a" {
+		t.Errorf("team label = %q, want the Machine's own label applied", labels["team"])
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonPoolConflict)
 }

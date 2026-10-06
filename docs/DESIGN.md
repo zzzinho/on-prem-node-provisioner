@@ -228,7 +228,7 @@ status:
 
 **`Machine.name = Node.name`.** 두 이름을 분리하면 노드 교체(같은 자리의 다른 하드웨어)를 깔끔하게 표현할 수 있다는 장점이 있다. 하지만 Phase 1에서는 두 이름의 일대일 매핑이 디버깅 단순함을 훨씬 크게 사 준다 — `kubectl get machine node-a01` 과 `kubectl get node node-a01` 이 같은 노드를 가리킨다. 노드 교체는 Machine 객체를 삭제·재생성하는 흐름으로 처리하고, 분리 가능성은 Phase 2 이상에서 다시 본다.
 
-**`machineSelector` (label) vs `ownerReference`.** ownerReference는 풀과 머신의 강결합을 표현하기 좋지만, ONP의 운영 모델은 "운영자가 Machine을 먼저 등록하고, 나중에 NodePool이 라벨로 묶는다"이다. ownerRef는 등록 순서에 종속되고, Machine을 풀에서 잠시 빼거나 옮기는 일이 라벨 한 줄 수정이 아니라 객체 수정이 된다. Kubernetes 관례(예: `Service` → `Pod` 라벨 셀렉터)와도 결을 같이 한다. **반대 트레이드오프**: 한 Machine이 두 NodePool에 동시에 매칭될 수 있다 — 이 경우 컨트롤러는 충돌을 감지해 Event로 알리고 reconcile을 보류한다.
+**`machineSelector` (label) vs `ownerReference`.** ownerReference는 풀과 머신의 강결합을 표현하기 좋지만, ONP의 운영 모델은 "운영자가 Machine을 먼저 등록하고, 나중에 NodePool이 라벨로 묶는다"이다. ownerRef는 등록 순서에 종속되고, Machine을 풀에서 잠시 빼거나 옮기는 일이 라벨 한 줄 수정이 아니라 객체 수정이 된다. Kubernetes 관례(예: `Service` → `Pod` 라벨 셀렉터)와도 결을 같이 한다. **반대 트레이드오프**: 한 Machine이 두 NodePool에 동시에 매칭될 수 있다 — 이 경우 컨트롤러는 충돌을 감지해 `PoolConflict` Event로 알리고, 어느 한 풀을 고르지 않는다. 자동 scale-up·scale-down 후보에서 빠지고, 수동 drain은 매칭된 풀들의 가장 보수적인 정책(force 없음, 가장 짧은 timeout)을 쓰며, Ready 때는 풀 template 없이 Machine 자체 라벨만 Node에 붙는다.
 
 ### 3.3 Key Workflows
 
@@ -429,6 +429,9 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 | power-off 요청 전부터 NotReady (네트워크 단절 등) | `Off` 로 확정하지 않음 — NotReady 전이가 `shutdownStartTime` 이후여야 꺼진 증거. shutdown timeout 후 `Failed` | 켜진 채 단절된 노드를 "꺼짐" 으로 기록하지 않기 위함 |
 | ShuttingDown 중 노드가 다시 부팅 | shutdown-agent 가 다시 끄지 않음(`PowerOffSkipped` Event) → shutdown timeout 후 `Failed` | 호스트 부팅 시각(`/proc/stat` btime)이 요청보다 뒤인지로 판정 |
 | 같은 Node 를 가리키는 Machine 둘 이상 | 모든 전원 동작 정지 + `DuplicateNode` Event, 1분마다 재확인 | `spec.nodeName` 은 불변이라 생성 시점의 중복만 가능 |
+| 풀 template 을 API 가 거절 (잘못된 라벨 값 등) | `TemplateRejected` 로 `Failed` + Event (wake-now 제거) | taint 는 key+effect 로 병합하므로 값 변경은 거절되지 않음 |
+| 노드는 켜져 있는데 Machine 은 `Off` | 전원 명령 없이 `Ready` 로 편입 + `Adopted` Event | NodeLost 뒤 복구, 수동 power-on, 이미 켜진 노드 위에 Machine 생성 |
+| 깨운 노드가 Ready 인데 파드가 아직 못 뜸 | Ready 후 2분 동안은 같은 파드를 위해 다른 Machine 을 깨우지 않음 | GPU device plugin 등록 지연 등. 고정 창이라 그보다 오래 막히는 원인은 fit 정확도 작업 대상 |
 | drain 중 노드에 always-on 라벨 | drain 중단, ONP cordon 해제, `Ready` 로 복귀 + `DrainRefused` Event | shutdown-agent 도 always-on 노드에는 배치되지 않음 |
 
 원칙은 일관된다: **모호한 성공은 만들지 않는다**. 의심스러우면 `Failed` 로 옮기고 사람을 부른다.

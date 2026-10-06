@@ -113,3 +113,24 @@ func noWorkloadOnNode(ctx context.Context, reader client.Reader, nodeName string
 	}
 	return true, nil
 }
+
+// nodeIsReady reports whether the named Node's Ready condition is True. A missing
+// Node is not Ready.
+func nodeIsReady(ctx context.Context, c client.Client, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, nil
+	}
+	var node corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			return cond.Status == corev1.ConditionTrue, nil
+		}
+	}
+	return false, nil
+}

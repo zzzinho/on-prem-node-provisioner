@@ -56,24 +56,26 @@ const bootPollInterval = 15 * time.Second
 // Event reasons surfaced on Machine objects. Kept as constants so the strings
 // operators grep for stay stable.
 const (
-	reasonWaking          = "Waking"
-	reasonPowerOnFailed   = "PowerOnFailed"
-	reasonReady           = "Ready"
-	reasonBootTimeout     = "BootTimeout"
-	reasonUnknownProvider = "UnknownProvider"
-	reasonCannotPowerOn   = "CannotPowerOn"
-	reasonPoweredOff      = "PoweredOff"
-	reasonDraining        = "Draining"
-	reasonDrainSucceeded  = "DrainSucceeded"
-	reasonDrainTimeout    = "DrainTimeout"
-	reasonUncordoned      = "Uncordoned"
-	reasonShutdownTimeout = "ShutdownTimeout"
-	reasonNodeLost        = "NodeLost"
-	reasonCapacityDrift   = "CapacityDrift"
-	reasonPoolConflict    = "PoolConflict"
-	reasonDrainRefused    = "DrainRefused"
-	reasonDuplicateNode   = "DuplicateNode"
-	reasonReservedLabel   = "ReservedLabel"
+	reasonWaking           = "Waking"
+	reasonPowerOnFailed    = "PowerOnFailed"
+	reasonReady            = "Ready"
+	reasonBootTimeout      = "BootTimeout"
+	reasonUnknownProvider  = "UnknownProvider"
+	reasonCannotPowerOn    = "CannotPowerOn"
+	reasonPoweredOff       = "PoweredOff"
+	reasonDraining         = "Draining"
+	reasonDrainSucceeded   = "DrainSucceeded"
+	reasonDrainTimeout     = "DrainTimeout"
+	reasonUncordoned       = "Uncordoned"
+	reasonShutdownTimeout  = "ShutdownTimeout"
+	reasonNodeLost         = "NodeLost"
+	reasonCapacityDrift    = "CapacityDrift"
+	reasonPoolConflict     = "PoolConflict"
+	reasonDrainRefused     = "DrainRefused"
+	reasonDuplicateNode    = "DuplicateNode"
+	reasonReservedLabel    = "ReservedLabel"
+	reasonTemplateRejected = "TemplateRejected"
+	reasonAdopted          = "Adopted"
 )
 
 // duplicateNodeRecheck is how often a Machine held because another Machine
@@ -214,6 +216,19 @@ func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machin
 	if err := r.removeDrainAnnotation(ctx, m); err != nil {
 		return ctrl.Result{}, err
 	}
+	// A Node that is up while its Machine reads Off — back after a node loss,
+	// powered on by hand, or a Machine created over a running node — is adopted as
+	// it is: no power-on, straight to Ready, so a running host is never reported
+	// (and left) as off.
+	ready, err := nodeIsReady(ctx, r.Client, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
+	}
+	if ready {
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonAdopted,
+			"Node %q is already Ready; adopting it without a power-on", m.Spec.NodeName)
+		return r.promoteToReady(ctx, m)
+	}
 	if !wakeRequested(m) {
 		return ctrl.Result{}, nil
 	}
@@ -271,72 +286,100 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 	if err := r.removeDrainAnnotation(ctx, m); err != nil {
 		return ctrl.Result{}, err
 	}
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	ready, err := nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
 	if ready {
-		// Record the wake latency before clearing the anchor: power-on -> Ready.
-		if m.Status.BootStartTime != nil {
-			metrics.ObserveScaleUpLatency(r.Clock.Since(m.Status.BootStartTime.Time))
-		}
-		// A node ONP cordoned during a prior scale-down is being woken back into
-		// service; lift that cordon so it can host pods again. An operator's manual
-		// cordon (no onp.io/cordoned-by-onp marker) is left alone.
-		uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		// Stamp the pool Template + Machine labels/taints onto the real Node so it
-		// carries what the fit simulation assumed when it chose to wake this Machine
-		// (DESIGN.md 3.2). Without this a pod whose nodeSelector matches a Template
-		// label passes fit but never binds, looping wake -> empty -> drain -> wake.
-		if err := r.applyNodeTemplate(ctx, m); err != nil {
-			return ctrl.Result{}, err
-		}
-		// Compare declared capacity to what the now-Ready Node reports, to warn (not
-		// auto-correct) on operator drift in the spec.capacity source of truth.
-		drift, err := r.capacityDrift(ctx, m)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		m.Status.State = v1alpha1.MachineStateReady
-		m.Status.BootStartTime = nil
-		setCondition(m, v1alpha1.ConditionReady, metav1.ConditionTrue, reasonReady, "backing Node is Ready")
-		if err := r.Status().Update(ctx, m); err != nil {
-			return ctrl.Result{}, fmt.Errorf("move machine %q to Ready: %w", m.Name, err)
-		}
-		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonReady, "Node %q is Ready", m.Spec.NodeName)
-		if uncordoned {
-			r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonUncordoned,
-				"uncordoned Node %q on wake (it was cordoned by a prior scale-down)", m.Spec.NodeName)
-		}
-		if drift != "" {
-			r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonCapacityDrift,
-				"declared spec.capacity differs from Node %q: %s (fit uses spec.capacity; reconcile this by hand)",
-				m.Spec.NodeName, drift)
-		}
-		// Clear the trigger so a stale annotation does not re-wake the node later.
-		if err := r.removeWakeAnnotation(ctx, m); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+		return r.promoteToReady(ctx, m)
 	}
 
 	if r.bootTimedOut(m) {
-		m.Status.State = v1alpha1.MachineStateFailed
-		setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonBootTimeout,
+		return r.failBoot(ctx, m, reasonBootTimeout,
 			fmt.Sprintf("Node %q not Ready within %s", m.Spec.NodeName, r.BootTimeout))
-		if err := r.Status().Update(ctx, m); err != nil {
-			return ctrl.Result{}, fmt.Errorf("fail machine %q on boot timeout: %w", m.Name, err)
-		}
-		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonBootTimeout,
-			"Node %q did not become Ready within %s", m.Spec.NodeName, r.BootTimeout)
-		return ctrl.Result{}, nil
 	}
 
 	r.resendPowerOn(ctx, m)
 	return ctrl.Result{RequeueAfter: r.requeueForBoot(m)}, nil
+}
+
+// promoteToReady moves a Machine whose Node is Ready into Ready: it lifts a cordon
+// ONP placed on a prior scale-down, stamps the pool template and Machine labels
+// onto the Node, warns on capacity drift, and clears the one-shot wake trigger.
+// A template the API server rejects is a configuration error no retry can fix,
+// so it fails the Machine instead of leaving it Booting — a Booting Machine holds
+// back every other wake that would fit the same pod.
+func (r *MachineReconciler) promoteToReady(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	// A node ONP cordoned during a prior scale-down is being woken back into
+	// service; lift that cordon so it can host pods again. An operator's manual
+	// cordon (no onp.io/cordoned-by-onp marker) is left alone.
+	uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Stamp the pool Template + Machine labels/taints onto the real Node so it
+	// carries what the fit simulation assumed when it chose to wake this Machine
+	// (DESIGN.md 3.2). Without this a pod whose nodeSelector matches a Template
+	// label passes fit but never binds, looping wake -> empty -> drain -> wake.
+	if err := r.applyNodeTemplate(ctx, m); err != nil {
+		if apierrors.IsInvalid(err) {
+			return r.failBoot(ctx, m, reasonTemplateRejected,
+				fmt.Sprintf("Node %q rejected the template: %v", m.Spec.NodeName, err))
+		}
+		if r.bootTimedOut(m) {
+			return r.failBoot(ctx, m, reasonBootTimeout,
+				fmt.Sprintf("Node %q is Ready but the template could not be applied within %s: %v", m.Spec.NodeName, r.BootTimeout, err))
+		}
+		return ctrl.Result{}, err
+	}
+	// Compare declared capacity to what the now-Ready Node reports, to warn (not
+	// auto-correct) on operator drift in the spec.capacity source of truth.
+	drift, err := r.capacityDrift(ctx, m)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Record the wake latency once, on the transition: power-on -> Ready.
+	if m.Status.BootStartTime != nil {
+		metrics.ObserveScaleUpLatency(r.Clock.Since(m.Status.BootStartTime.Time))
+	}
+	m.Status.State = v1alpha1.MachineStateReady
+	m.Status.BootStartTime = nil
+	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionTrue, reasonReady, "backing Node is Ready")
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("move machine %q to Ready: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonReady, "Node %q is Ready", m.Spec.NodeName)
+	if uncordoned {
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonUncordoned,
+			"uncordoned Node %q on wake (it was cordoned by a prior scale-down)", m.Spec.NodeName)
+	}
+	if drift != "" {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonCapacityDrift,
+			"declared spec.capacity differs from Node %q: %s (fit uses spec.capacity; reconcile this by hand)",
+			m.Spec.NodeName, drift)
+	}
+	// Clear the trigger so a stale annotation does not re-wake the node later.
+	if err := r.removeWakeAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// failBoot moves a Machine that cannot finish booting into Failed — terminal, an
+// operator resolves it — with a Ready=False condition and a Warning Event.
+func (r *MachineReconciler) failBoot(ctx context.Context, m *v1alpha1.Machine, reason, message string) (ctrl.Result, error) {
+	m.Status.State = v1alpha1.MachineStateFailed
+	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, message)
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("fail machine %q: %w", m.Name, err)
+	}
+	r.Recorder.Event(m, corev1.EventTypeWarning, reason, message)
+	// The wake request is spent: left in place it would power the node on again
+	// the moment an operator returns the Machine to Off.
+	if err := r.removeWakeAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 // resendPowerOn repeats the power-on while a Machine is Booting. One command can
@@ -390,7 +433,7 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 	// No drain pending: a Ready Machine whose backing Node has gone NotReady was
 	// lost outside ONP (powered off by hand, crashed, partitioned). Fall back to
 	// Off after a grace window so scale-up can wake it again.
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	ready, err := nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
@@ -667,27 +710,6 @@ func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alph
 	return ctrl.Result{}, nil
 }
 
-// nodeReady reports whether the named Node exists and has a Ready condition of
-// True. A missing Node is not an error: the node may not have registered yet.
-func (r *MachineReconciler) nodeReady(ctx context.Context, nodeName string) (bool, error) {
-	if nodeName == "" {
-		return false, nil
-	}
-	var node corev1.Node
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	for _, c := range node.Status.Conditions {
-		if c.Type == corev1.NodeReady {
-			return c.Status == corev1.ConditionTrue, nil
-		}
-	}
-	return false, nil
-}
-
 // bootTimedOut reports whether the Machine has been Booting longer than
 // BootTimeout. A missing BootStartTime is treated as not-yet-timed-out so a
 // half-written status never trips a false failure.
@@ -719,40 +741,64 @@ func (r *MachineReconciler) shutdownTimedOut(m *v1alpha1.Machine) bool {
 }
 
 // drainPolicy resolves the drain budget and force flag for a Machine from its
-// NodePool's drain spec in a single pool lookup: drain.timeoutSeconds (falling
-// back to defaultDrainTimeout) and drain.force (default false). The first matching
-// pool wins; pool overlap is a conflict surfaced elsewhere, not resolved here.
+// NodePool's drain spec: drain.timeoutSeconds (falling back to
+// defaultDrainTimeout) and drain.force (default false). A Machine matching more
+// than one pool gets the most conservative reading of all of them — never force,
+// stop at the shortest budget — rather than whichever pool happened to list
+// first.
 func (r *MachineReconciler) drainPolicy(ctx context.Context, m *v1alpha1.Machine) (timeout time.Duration, force bool, err error) {
-	pool, err := poolForMachine(ctx, r.Client, m)
+	pool, conflict, err := poolForMachine(ctx, r.Client, m)
 	if err != nil {
 		return 0, false, err
 	}
-	timeout = defaultDrainTimeout
-	if pool != nil {
-		if pool.Spec.Drain.TimeoutSeconds != nil {
-			timeout = time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second
-		}
-		force = pool.Spec.Drain.Force
+	if len(conflict) > 0 {
+		return conservativeDrainTimeout(conflict), false, nil
 	}
+	timeout, force = poolDrainPolicy(pool)
 	return timeout, force, nil
 }
 
-// poolForMachine returns the first NodePool whose machineSelector matches the
-// Machine's labels, or nil when none match. It mirrors NodePoolReconciler's
-// selector logic (metav1.LabelSelectorAsSelector + a labels.Set match); the pool
-// count is assumed small, so a full list per reconcile is acceptable. The drain
-// (timeout resolution) path uses it; a Machine matching more than one pool is a
-// conflict the scale-down path surfaces and holds on (matchingPools), so first
-// match here only ever bounds an operator-triggered manual drain.
-func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (*v1alpha1.NodePool, error) {
+// poolDrainPolicy reads one pool's drain spec; a nil pool yields the defaults.
+func poolDrainPolicy(pool *v1alpha1.NodePool) (time.Duration, bool) {
+	if pool == nil {
+		return defaultDrainTimeout, false
+	}
+	timeout := defaultDrainTimeout
+	if pool.Spec.Drain.TimeoutSeconds != nil {
+		timeout = time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second
+	}
+	return timeout, pool.Spec.Drain.Force
+}
+
+// conservativeDrainTimeout returns the shortest drain budget across pools: a
+// drain that cannot finish stops — uncordon, Failed — at the earliest point any
+// of them allows.
+func conservativeDrainTimeout(pools []v1alpha1.NodePool) time.Duration {
+	shortest, _ := poolDrainPolicy(&pools[0])
+	for i := 1; i < len(pools); i++ {
+		if t, _ := poolDrainPolicy(&pools[i]); t < shortest {
+			shortest = t
+		}
+	}
+	return shortest
+}
+
+// poolForMachine returns the NodePool whose machineSelector matches the Machine,
+// or nil when none does. When more than one matches it returns them all as
+// conflict and no pool: the caller must not pick one (DESIGN.md 3.2).
+func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (pool *v1alpha1.NodePool, conflict []v1alpha1.NodePool, err error) {
 	pools, err := matchingPools(ctx, c, m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if len(pools) == 0 {
-		return nil, nil
+	switch len(pools) {
+	case 0:
+		return nil, nil, nil
+	case 1:
+		return &pools[0], nil, nil
+	default:
+		return nil, pools, nil
 	}
-	return &pools[0], nil
 }
 
 // matchingPools returns every NodePool whose machineSelector matches the Machine's
@@ -776,6 +822,9 @@ func matchingPools(ctx context.Context, c client.Client, m *v1alpha1.Machine) ([
 			matched = append(matched, pools.Items[i])
 		}
 	}
+	// The cache lists in map order; sort so every caller sees the same pools in the
+	// same order on every reconcile.
+	sort.Slice(matched, func(a, b int) bool { return matched[a].Name < matched[b].Name })
 	return matched, nil
 }
 
@@ -799,9 +848,14 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 	if m.Spec.NodeName == "" {
 		return nil
 	}
-	pool, err := poolForMachine(ctx, r.Client, m)
+	pool, conflict, err := poolForMachine(ctx, r.Client, m)
 	if err != nil {
 		return err
+	}
+	if len(conflict) > 0 {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonPoolConflict,
+			"Machine %q matches %d NodePools (%s); applying only its own labels, no pool template, until the overlap is resolved",
+			m.Name, len(conflict), poolNames(conflict))
 	}
 	desiredLabels := map[string]string{}
 	if pool != nil {
@@ -844,10 +898,9 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 		}
 	}
 	for _, t := range desiredTaints {
-		if !hasTaint(node.Spec.Taints, t) {
-			node.Spec.Taints = append(node.Spec.Taints, t)
-			changed = true
-		}
+		var merged bool
+		node.Spec.Taints, merged = mergeTaint(node.Spec.Taints, t)
+		changed = changed || merged
 	}
 	if !changed {
 		return nil
@@ -858,15 +911,22 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 	return nil
 }
 
-// hasTaint reports whether taints already contains an entry equal to t on key,
-// value and effect.
-func hasTaint(taints []corev1.Taint, t corev1.Taint) bool {
+// mergeTaint puts t into taints and reports whether that changed them. A taint
+// is identified by key and effect — the API server rejects two with the same pair
+// — so a template that changes a taint's value replaces the Node's entry rather
+// than adding a second one.
+func mergeTaint(taints []corev1.Taint, t corev1.Taint) ([]corev1.Taint, bool) {
 	for i := range taints {
-		if taints[i].Key == t.Key && taints[i].Value == t.Value && taints[i].Effect == t.Effect {
-			return true
+		if taints[i].Key != t.Key || taints[i].Effect != t.Effect {
+			continue
 		}
+		if taints[i].Value == t.Value {
+			return taints, false
+		}
+		taints[i].Value = t.Value
+		return taints, true
 	}
-	return false
+	return append(taints, t), true
 }
 
 // capacityDrift compares the Machine's declared spec.capacity to what its backing
@@ -1223,16 +1283,5 @@ func (r *MachineReconciler) machinesForNode(ctx context.Context, obj client.Obje
 	if !ok {
 		return nil
 	}
-	var machines v1alpha1.MachineList
-	if err := r.List(ctx, &machines, client.MatchingFields{IndexMachineNodeName: node.Name}); err != nil {
-		log.FromContext(ctx).Error(err, "list machines for node", "node", node.Name)
-		return nil
-	}
-	requests := make([]reconcile.Request, 0, len(machines.Items))
-	for i := range machines.Items {
-		requests = append(requests, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: machines.Items[i].Name},
-		})
-	}
-	return requests
+	return requestsForMachinesOnNode(ctx, r.Client, node.Name)
 }
