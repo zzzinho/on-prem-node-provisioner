@@ -44,6 +44,17 @@ func scaleMachine(name string, lbls map[string]string, cpu, mem string, state v1
 	return m
 }
 
+// readyMachineSince builds a Ready pool member whose Ready condition turned True
+// at since.
+func readyMachineSince(name string, lbls map[string]string, since time.Time) *v1alpha1.Machine {
+	m := scaleMachine(name, lbls, "4", "8Gi", v1alpha1.MachineStateReady)
+	m.Status.Conditions = []metav1.Condition{{
+		Type: v1alpha1.ConditionReady, Status: metav1.ConditionTrue,
+		Reason: "Ready", LastTransitionTime: metav1.NewTime(since),
+	}}
+	return m
+}
+
 // pendingPod builds an unbound Pending Pod requesting cpu/mem. When unsched is
 // true it carries the PodScheduled=False/Unschedulable condition that marks it a
 // scale-up candidate.
@@ -168,6 +179,26 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
 			},
 			wantWoken: []string{"failing", "idle"}, // failing keeps its retry; idle serves the pod
+			wantEvent: true,
+		},
+		{
+			name: "machine that just reached Ready holds waking another fit machine",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				readyMachineSince("fresh", gpu, scaleUpBase.Add(-30*time.Second)),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "machine Ready for longer than the settle window does not hold",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				readyMachineSince("settled", gpu, scaleUpBase.Add(-10*time.Minute)),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: []string{"idle"},
 			wantEvent: true,
 		},
 		{

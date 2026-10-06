@@ -33,6 +33,16 @@ const scaleUpRequeue = 30 * time.Second
 // a Machine added or relabelled later is reconsidered without a Warning storm.
 const noFitRequeue = 60 * time.Second
 
+// readySettle is how long after reaching Ready a fitting Machine still counts as
+// a wake in flight. A just-woken node often cannot take its pod yet — the GPU
+// device plugin registers after the kubelet goes Ready — and without the window
+// the pod's next reconcile would wake another Machine for it.
+//
+// ponytail: a fixed window. A pod blocked for longer by something fit does not
+// model wakes the next Machine after it; the fit-fidelity work (pod volumes, real
+// Node labels and taints) is the upgrade path.
+const readySettle = 2 * time.Minute
+
 // minCooldownRequeue floors the requeue we compute from a pool's cooldown
 // expiry, so a near-zero remaining interval still yields a real wait rather than
 // a hot loop racing the clock's resolution.
@@ -137,7 +147,7 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if !scheduler.Fit(&pod, node).Fits {
 				continue
 			}
-			if isWaking(m) {
+			if isWaking(m) || r.settling(m) {
 				wakeInFlight = true
 				continue
 			}
@@ -366,6 +376,16 @@ func cpuMilli(m *v1alpha1.Machine) *resource.Quantity {
 func memBytes(m *v1alpha1.Machine) *resource.Quantity {
 	q := m.Spec.Capacity[corev1.ResourceMemory]
 	return &q
+}
+
+// settling reports whether a Machine reached Ready within readySettle — woken,
+// most likely for this very pod, and not yet able to take it.
+func (r *ScaleUpReconciler) settling(m *v1alpha1.Machine) bool {
+	if m.Status.State != v1alpha1.MachineStateReady {
+		return false
+	}
+	c := meta.FindStatusCondition(m.Status.Conditions, v1alpha1.ConditionReady)
+	return c != nil && c.Status == metav1.ConditionTrue && r.Clock.Since(c.LastTransitionTime.Time) < readySettle
 }
 
 // isWaking reports whether a Machine already has a wake in progress that will
