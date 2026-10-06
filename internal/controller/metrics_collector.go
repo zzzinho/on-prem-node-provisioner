@@ -16,6 +16,21 @@ import (
 // poolUnassigned is the onp_nodes_total pool label for a Machine matching no pool.
 const poolUnassigned = "<none>"
 
+// poolConflicted is the onp_nodes_total pool label for a Machine matching more
+// than one pool, which belongs to none of them until the overlap is resolved.
+const poolConflicted = "<conflict>"
+
+// machineStates are the lifecycle states every pool reports, zero included, so
+// an alert such as "no Ready node in pool" has a series to fire on.
+var machineStates = []v1alpha1.MachineState{
+	v1alpha1.MachineStateOff,
+	v1alpha1.MachineStateBooting,
+	v1alpha1.MachineStateReady,
+	v1alpha1.MachineStateDraining,
+	v1alpha1.MachineStateShuttingDown,
+	v1alpha1.MachineStateFailed,
+}
+
 // StateCollector exposes the two current-state gauges — onp_nodes_total{pool,state}
 // and onp_pending_unschedulable — by listing live objects at scrape time rather
 // than tracking deltas in reconcilers. Computing at scrape keeps the gauges
@@ -75,13 +90,18 @@ func (c *StateCollector) collectNodes(ctx context.Context, ch chan<- prometheus.
 
 	type key struct{ pool, state string }
 	counts := map[key]int{}
+	for i := range pools.Items {
+		for _, state := range machineStates {
+			counts[key{pools.Items[i].Name, string(state)}] = 0
+		}
+	}
 	for i := range machines.Items {
 		m := &machines.Items[i]
 		state := string(m.Status.State)
 		if state == "" {
 			state = "Unknown"
 		}
-		counts[key{firstPoolName(m, pools.Items), state}]++
+		counts[key{poolLabel(m, pools.Items), state}]++
 	}
 	for k, v := range counts {
 		ch <- prometheus.MustNewConstMetric(c.nodesTotal, prometheus.GaugeValue, float64(v), k.pool, k.state)
@@ -103,20 +123,21 @@ func (c *StateCollector) collectPending(ctx context.Context, ch chan<- prometheu
 	ch <- prometheus.MustNewConstMetric(c.pendingUnschedulable, prometheus.GaugeValue, float64(n))
 }
 
-// firstPoolName returns the name of the first pool whose selector matches the
-// Machine's labels, or poolUnassigned. It mirrors poolForMachine's "first match
-// wins" over an already-listed pool slice, so the collector lists pools once per
-// scrape instead of once per Machine.
-func firstPoolName(m *v1alpha1.Machine, pools []v1alpha1.NodePool) string {
+// poolLabel names the pool a Machine is counted under: the one pool whose
+// machineSelector matches it, poolUnassigned for none, poolConflicted for more
+// than one (no pool's policy applies to it then).
+func poolLabel(m *v1alpha1.Machine, pools []v1alpha1.NodePool) string {
 	machineLabels := labels.Set(m.Labels)
+	name := poolUnassigned
 	for i := range pools {
 		selector, err := metav1.LabelSelectorAsSelector(&pools[i].Spec.MachineSelector)
-		if err != nil {
+		if err != nil || !selector.Matches(machineLabels) {
 			continue
 		}
-		if selector.Matches(machineLabels) {
-			return pools[i].Name
+		if name != poolUnassigned {
+			return poolConflicted
 		}
+		name = pools[i].Name
 	}
-	return poolUnassigned
+	return name
 }
