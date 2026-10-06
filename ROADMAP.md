@@ -257,6 +257,16 @@
 - [x] **풀 충돌** — 정렬로 결정적, drain 은 force 없이 최단 timeout, template 은 Machine 라벨만, scale-up 후보에서 제외.
 - [x] **검증** — 실클러스터 배포 (2026-10-06, `helm upgrade` 0.6.3→0.6.4, CRD 무변). 세 컴포넌트 0.6.4 Running, `desktop` Ready 유지, 에러 로그 없음. 각 수정은 단위 테스트로 커버(되돌리면 해당 테스트 실패 확인).
 
+### M5.11 — fit 정확도 (차트 0.7.0)
+
+**왜**: 전수 점검(M5.9)의 세 번째 그룹. 가상 노드(꺼진 Machine 이 켜졌을 때의 모습)가 실제 노드와 달라, 깨워야 할 때 안 깨우거나 쓸모없이 깨웠다.
+
+- [x] **판정을 Predicate 목록으로** — `scheduler.Fit` 의 세 검사를 `defaultPredicates` 로 분리, 호출 측이 extra Predicate 를 넘긴다(동작 변경 없는 리팩터링). 새 조건은 판정 함수 추가로 끝난다.
+- [x] **실제 Node 에서 출발** — 라벨(`kubernetes.io/os`·`arch`·hostname·GFD/NFD) 위에 template·Machine 라벨, 운영자 cordon·taint 유지(`node.kubernetes.io/*` 와 ONP cordon 제외). cordon 판정 `schedulable` 을 기본 Predicate 로 추가.
+- [x] **용량** — 기본 자원은 spec 과 마지막 보고 allocatable 중 작은 값, 선언된 확장 자원은 상한 없음, 미선언 자원은 Node 값, 배정된 채 남은 파드의 요청량을 뺌(종료 중 파드 제외). CapacityDrift 는 Allocatable 과 비교.
+- [x] **PV node affinity** — `scheduler.VolumeNodeAffinity`. PVC·PV 는 APIReader 로 get 만(RBAC get 추가, list/watch 없음).
+- [x] **검증** — 실클러스터 배포 (2026-10-06, `helm upgrade` 0.6.4→0.7.0, CRD 무변, ClusterRole 갱신). 세 컴포넌트 0.7.0 Running, `desktop` Ready 유지, 에러 로그 없음. 각 판정은 단위 테스트로 커버(되돌리면 해당 테스트 실패 확인). 참고: 검증 클러스터의 kube-apiserver 는 `--authorization-mode=AlwaysAllow` 라 RBAC 가 강제되지 않는다 — 차트 ClusterRole 은 생성된 `config/rbac/role.yaml` 과 rules 가 같음을 확인하는 것으로 갈음.
+
 ---
 
 ## Phase 2 — 운영성

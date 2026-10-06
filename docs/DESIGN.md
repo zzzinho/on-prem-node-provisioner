@@ -224,7 +224,9 @@ status:
 
 #### 핵심 트레이드오프
 
-**`capacity` 를 spec에 두는 것.** 가장 자연스러운 자리는 `status` 다 — 실제 capacity는 노드가 켜진 뒤 kubelet이 보고하는 값이다. 그러나 ONP의 핵심 결정(fit check)은 **노드가 꺼진 상태에서** 일어난다. 꺼진 노드에서 status는 stale 하거나 비어 있다. 그래서 spec에 두고 **운영자가 정확히 적는 것**을 source of truth로 삼는다. 비용은 명백하다: 사람이 잘못 적으면 컨트롤러가 잘못된 fit 결정을 내린다. 이를 보완하려고 노드가 Ready 된 뒤 `Node.Status.Capacity` 와 비교해 어긋나면 Event/Condition으로 경고한다 (자동 수정은 하지 않는다 — 운영자의 의도일 수 있으므로).
+**`capacity` 를 spec에 두는 것.** 가장 자연스러운 자리는 `status` 다 — 실제 capacity는 노드가 켜진 뒤 kubelet이 보고하는 값이다. 그러나 ONP의 핵심 결정(fit check)은 **노드가 꺼진 상태에서** 일어난다. 꺼진 노드에서 status는 stale 하거나 비어 있다. 그래서 spec에 두고 **운영자가 정확히 적는 것**을 source of truth로 삼는다. 비용은 명백하다: 사람이 잘못 적으면 컨트롤러가 잘못된 fit 결정을 내린다. 이를 보완하려고 노드가 Ready 된 뒤 `Node.Status.Allocatable` 과 비교해 어긋나면 Event/Condition으로 경고한다 (자동 수정은 하지 않는다 — 운영자의 의도일 수 있으므로).
+
+다만 꺼진 노드도 **Node 객체는 남는다**. 그래서 fit 은 spec 만이 아니라 그 객체에서 남는 사실을 함께 쓴다(0.7.0). 라벨(`kubernetes.io/os`·`arch`, GFD/NFD 라벨)과 운영자가 건 cordon·taint 는 부팅 뒤에도 그대로라 가상 노드에 옮긴다(`node.kubernetes.io/*` 수명주기 taint 와 ONP 자신의 cordon 은 뺀다). 용량은 기본 자원(cpu·memory 등)만 spec 과 마지막 보고 allocatable 중 작은 값을 쓴다 — 선언된 확장 자원(`nvidia.com/gpu`)은 device plugin 이 등록 전·종료 직후 0 을 보고할 수 있어 상한을 걸지 않는다. spec 에 없는 자원은 Node 값을 쓰고, 노드에 배정된 채 남은 파드(DaemonSet 등)의 요청량을 뺀다. 파드가 마운트한 PV 의 node affinity 도 판정에 넣는다.
 
 **`Machine.name = Node.name`.** 두 이름을 분리하면 노드 교체(같은 자리의 다른 하드웨어)를 깔끔하게 표현할 수 있다는 장점이 있다. 하지만 Phase 1에서는 두 이름의 일대일 매핑이 디버깅 단순함을 훨씬 크게 사 준다 — `kubectl get machine node-a01` 과 `kubectl get node node-a01` 이 같은 노드를 가리킨다. 노드 교체는 Machine 객체를 삭제·재생성하는 흐름으로 처리하고, 분리 가능성은 Phase 2 이상에서 다시 본다.
 

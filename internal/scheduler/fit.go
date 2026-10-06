@@ -3,18 +3,22 @@
 // on and Ready? This is a fit *simulation*, not real scheduling — kube-scheduler
 // remains the authority. ONP uses it to choose which powered-off Machine to wake.
 //
-// Only predicates decidable without live cluster state are evaluated, because the
-// target node is OFF (zero running pods, a stale or empty kubelet Node.Status):
+// The target node is OFF, so every rule is a Predicate over the Pod and a
+// synthetic Node describing how that node will look once Ready. The defaults:
 //
 //   - the node is not cordoned (unless the Pod tolerates it),
-//   - resource requests fit the node's allocatable,
 //   - nodeSelector and required node affinity match the node's labels,
-//   - the Pod tolerates the node's NoSchedule / NoExecute taints.
+//   - the Pod tolerates the node's NoSchedule / NoExecute taints,
+//   - resource requests fit the node's allocatable.
 //
-// The following are intentionally excluded in Phase 1 because they need live
-// cluster state or are scoring rather than hard predicates: preferred affinity
-// and other scoring, inter-pod affinity / anti-affinity, topology spread, host
-// ports, volume / CSI limits, and the resource usage of already-running pods.
+// A rule that needs cluster state the package does not hold is a Predicate the
+// caller builds and passes to Fit — VolumeNodeAffinity for the node affinity of
+// the Pod's bound PersistentVolumes. The room taken by pods still bound to the
+// node is the caller's to subtract from the synthetic allocatable.
+//
+// Still excluded, because they need live placement state or are scoring rather
+// than hard predicates: preferred affinity and other scoring, inter-pod affinity
+// / anti-affinity, topology spread, host ports, and volume count / CSI limits.
 //
 // The package operates on core types (*corev1.Pod, *corev1.Node) only, with no
 // dependency on ONP's CRD types; assembling a synthetic Node from a Machine is a
