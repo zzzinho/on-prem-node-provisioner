@@ -97,3 +97,19 @@ func nodeWentDownSince(ctx context.Context, c client.Client, nodeName string, si
 	}
 	return false, nil
 }
+
+// noWorkloadOnNode reports, reading through reader, whether no workload pod (by
+// isWorkload) remains on the node. The drain hands a node to the power-off leg on
+// this answer, so the caller passes an uncached reader.
+func noWorkloadOnNode(ctx context.Context, reader client.Reader, nodeName string) (bool, error) {
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
+		return false, fmt.Errorf("list pods on node %q: %w", nodeName, err)
+	}
+	for i := range pods.Items {
+		if isWorkload(&pods.Items[i]) {
+			return false, nil
+		}
+	}
+	return true, nil
+}

@@ -164,6 +164,7 @@ func newFixture(t *testing.T, objs ...client.Object) *reconcilerFixture {
 		NodeLossGracePeriod: time.Minute,
 		Recorder:            record.NewFakeRecorder(16),
 		Clock:               fc,
+		APIReader:           cl,
 		// Stub Evict: the fake client's eviction subresource deletes the pod
 		// unconditionally and never returns the PDB-blocked TooManyRequests we
 		// must exercise, so the test drives eviction through this stub.
@@ -731,21 +732,26 @@ func TestReconcileDrainingEvictsAndMovesToShuttingDown(t *testing.T) {
 
 	f := newFixture(t, m, readyNode("node-a"), normalPod("app-1", "node-a"))
 
-	// First pass: node has one evictable pod. It should be cordoned, the pod
-	// evicted, and the Machine left Draining with a poll requeue.
+	// First pass: the node is cordoned and nothing else happens — the scheduler
+	// gets one poll to see the cordon before any emptiness judgement.
 	res := f.reconcile(t)
+	if res.RequeueAfter != drainPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v (settle after cordon)", res.RequeueAfter, drainPollInterval)
+	}
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none on the cordon pass", f.evicted)
+	}
+	if !f.getNode(t, "node-a").Spec.Unschedulable {
+		t.Error("node not cordoned, want unschedulable=true")
+	}
+
+	// Second pass: the pod is evicted and the Machine stays Draining.
+	res = f.reconcile(t)
 	if res.RequeueAfter != drainPollInterval {
 		t.Errorf("RequeueAfter = %v, want %v (eviction in flight)", res.RequeueAfter, drainPollInterval)
 	}
 	if len(f.evicted) != 1 || f.evicted[0] != "app-1" {
 		t.Errorf("evicted = %v, want [app-1]", f.evicted)
-	}
-	var node corev1.Node
-	if err := f.cl.Get(context.Background(), types.NamespacedName{Name: "node-a"}, &node); err != nil {
-		t.Fatalf("get node: %v", err)
-	}
-	if !node.Spec.Unschedulable {
-		t.Error("node not cordoned, want unschedulable=true")
 	}
 	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateDraining {
 		t.Errorf("state = %q, want %q (still draining)", got.Status.State, v1alpha1.MachineStateDraining)
@@ -791,7 +797,7 @@ func TestReconcileDrainingExcludesUnevictablePods(t *testing.T) {
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	f := newFixture(t, m, readyNode("node-a"), dsPod, mirrorPod)
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), dsPod, mirrorPod)
 
 	f.reconcile(t)
 
@@ -878,6 +884,36 @@ func TestReconcileDrainingAbortsOnAlwaysOnNode(t *testing.T) {
 	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonDrainRefused)
 }
 
+// TestReconcileDrainingConfirmsEmptyWithAPI: the cache says the node is empty
+// but the API server already holds a pod bound there — the drain keeps waiting
+// instead of handing a node with workload to the power-off leg.
+func TestReconcileDrainingConfirmsEmptyWithAPI(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"))
+	// A second fake client stands in for the API server, where a pod just bound
+	// to the node is already visible.
+	f.r.APIReader = fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithIndex(&corev1.Pod{}, IndexPodNodeName, func(o client.Object) []string {
+			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).
+		WithObjects(normalPod("just-bound", "node-a")).
+		Build()
+
+	res := f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateDraining {
+		t.Errorf("state = %q, want %q while the API still shows a pod", got, v1alpha1.MachineStateDraining)
+	}
+	if res.RequeueAfter != drainPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, drainPollInterval)
+	}
+}
+
 func TestReconcileDrainingTimesOutUncordonsAndFails(t *testing.T) {
 	t.Parallel()
 
@@ -893,7 +929,7 @@ func TestReconcileDrainingTimesOutUncordonsAndFails(t *testing.T) {
 	if err := f.cl.Status().Update(context.Background(), m); err != nil {
 		t.Fatalf("seed DrainStartTime: %v", err)
 	}
-	if err := f.r.setCordon(context.Background(), "node-a", true); err != nil {
+	if _, err := f.r.setCordon(context.Background(), "node-a", true); err != nil {
 		t.Fatalf("pre-cordon node: %v", err)
 	}
 	f.clock.Step(61 * time.Second)
@@ -927,7 +963,7 @@ func TestReconcileDrainingBlockedEvictionStaysDraining(t *testing.T) {
 	start := metav1.NewTime(time.Now())
 	m.Status.DrainStartTime = &start
 
-	f := newFixture(t, m, readyNode("node-a"), normalPod("pdb-1", "node-a"))
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), normalPod("pdb-1", "node-a"))
 	// A PDB-blocked eviction comes back as TooManyRequests; the drain must treat
 	// it as expected, not as a failure.
 	f.evictErr = apierrors.NewTooManyRequests("disruption budget", 0)
@@ -991,7 +1027,7 @@ func TestReconcileDrainingForceEvictsDoNotDisruptPod(t *testing.T) {
 	pool := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
 	pool.Spec.Drain.Force = true
 
-	f := newFixture(t, m, readyNode("node-a"), pool, doNotDisruptPod("protected-1", "node-a"))
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), pool, doNotDisruptPod("protected-1", "node-a"))
 
 	f.reconcile(t)
 

@@ -132,6 +132,10 @@ type MachineReconciler struct {
 	// back to the controller-runtime Eviction subresource (wired in
 	// SetupWithManager).
 	Evict func(ctx context.Context, pod *corev1.Pod) error
+	// APIReader reads straight from the API server, bypassing the informer cache.
+	// The drain's last emptiness check goes through it before the node is handed
+	// to the irreversible power-off leg. main.go wires mgr.GetAPIReader().
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
@@ -517,8 +521,15 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.setCordon(ctx, m.Spec.NodeName, true); err != nil {
+	cordoned, err := r.setCordon(ctx, m.Spec.NodeName, true)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if cordoned {
+		// The scheduler may still bind a pod here until it sees the cordon; give it
+		// one poll before judging the node empty, or a pod placed a moment ago could
+		// ride the node down.
+		return ctrl.Result{RequeueAfter: drainPollInterval}, nil
 	}
 
 	// The node is empty for power-off once no workload pods remain — including any
@@ -533,6 +544,15 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	}
 
 	if len(workload) == 0 {
+		// The cache says empty; the power-off leg is irreversible, so confirm with
+		// the API server — the cache may not yet show a pod bound a moment ago.
+		drained, err := noWorkloadOnNode(ctx, r.APIReader, m.Spec.NodeName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !drained {
+			return ctrl.Result{RequeueAfter: drainPollInterval}, nil
+		}
 		// Node is empty: hand off to the power-off leg. Leave it cordoned — it is
 		// on its way down, and reconcileShuttingDown + the agent finish it. Anchor
 		// the shutdown timeout from here so a power-off that never lands fails
@@ -892,23 +912,23 @@ func (r *MachineReconciler) capacityDrift(ctx context.Context, m *v1alpha1.Machi
 // since the node being unschedulable is all the drain needs. Uncordon clears the
 // state and drops the marker; callers gate it on the marker (uncordonIfONPCordoned)
 // so an operator's manual cordon is never lifted.
-func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) error {
+func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) (bool, error) {
 	if nodeName == "" {
-		return nil
+		return false, nil
 	}
 	var node corev1.Node
 	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("get node %q to cordon: %w", nodeName, err)
+		return false, fmt.Errorf("get node %q to cordon: %w", nodeName, err)
 	}
 
 	if unschedulable {
 		if node.Spec.Unschedulable {
 			// Already cordoned (operator's, or ours from a prior reconcile). Do not
 			// claim it by stamping the marker.
-			return nil
+			return false, nil
 		}
 		patch := client.MergeFrom(node.DeepCopy())
 		node.Spec.Unschedulable = true
@@ -917,22 +937,22 @@ func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unsc
 		}
 		node.Annotations[v1alpha1.AnnotationCordonedByONP] = "true"
 		if err := r.Patch(ctx, &node, patch); err != nil {
-			return fmt.Errorf("cordon node %q: %w", nodeName, err)
+			return false, fmt.Errorf("cordon node %q: %w", nodeName, err)
 		}
-		return nil
+		return true, nil
 	}
 
 	_, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]
 	if !node.Spec.Unschedulable && !marked {
-		return nil
+		return false, nil
 	}
 	patch := client.MergeFrom(node.DeepCopy())
 	node.Spec.Unschedulable = false
 	delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
 	if err := r.Patch(ctx, &node, patch); err != nil {
-		return fmt.Errorf("uncordon node %q: %w", nodeName, err)
+		return false, fmt.Errorf("uncordon node %q: %w", nodeName, err)
 	}
-	return nil
+	return true, nil
 }
 
 // uncordonIfONPCordoned lifts a cordon ONP placed during a prior scale-down, so a
@@ -954,7 +974,7 @@ func (r *MachineReconciler) uncordonIfONPCordoned(ctx context.Context, nodeName 
 	if _, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]; !marked {
 		return false, nil
 	}
-	if err := r.setCordon(ctx, nodeName, false); err != nil {
+	if _, err := r.setCordon(ctx, nodeName, false); err != nil {
 		return false, err
 	}
 	return true, nil

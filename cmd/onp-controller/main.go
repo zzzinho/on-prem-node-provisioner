@@ -148,6 +148,7 @@ func main() {
 		NodeLossGracePeriod: nodeLossGracePeriod,
 		Recorder:            mgr.GetEventRecorderFor("onp-controller"),
 		Clock:               clock.RealClock{},
+		APIReader:           mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up machine reconciler")
 		os.Exit(1)
