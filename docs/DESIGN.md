@@ -384,7 +384,7 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 세 컴포넌트는 각자 다른 권한 표면을 가진다. 권한은 모두 **그 컴포넌트가 자기 일을 하는 데 필요한 최소치**로 제한한다.
 
 - **onp-shutdown-agent**: `privileged: true`, `hostPID` — `nsenter` 로 호스트 PID 1 의 namespace 에 진입해 호스트의 `systemctl poweroff` 를 실행하려면 필요하다. 블래스트 반경은 두 가지로 통제한다. (a) Pod Security Admission `privileged` 네임스페이스로 격리 — 다른 워크로드가 같은 PSA 레벨로 흘러들지 않도록. (b) RBAC 는 `Machine` read-only 만. cluster-wide list/watch 권한은 갖되, agent 코드가 **자기 호스트(`spec.nodeName == $NODE_NAME`)에 해당하는 Machine 만** 처리하도록 필터링하고, 어떤 Machine 도 수정하지 않는다 (전원 차단은 로컬 명령이고, 상태 갱신은 컨트롤러 몫).
-- **onp-wol-agent**: `hostNetwork: true`. HTTP 포트가 호스트 NIC 에 노출된다. `hostNetwork` 파드는 CNI 를 우회하므로 NetworkPolicy 로 보호되지 않는다 — 그래서 컨트롤러와 agent 가 **공유 bearer token** 으로 인증한다 (Helm 이 생성·persist 하는 Secret, 양쪽에 주입). 토큰 없는 요청은 `401` 로 거절하고, 비교는 constant-time. 페이로드는 `MaxBytesReader` 로 제한한다. agent 는 매직 패킷 송신 외에 아무 권한도 없어, 토큰이 새어도 블래스트 반경은 "임의 MAC 으로 wake 패킷 송신" 에 그친다.
+- **onp-wol-agent**: `hostNetwork: true`. HTTP 포트가 호스트 NIC 에 노출된다. `hostNetwork` 파드는 CNI 를 우회하므로 NetworkPolicy 로 보호되지 않는다 — 그래서 컨트롤러와 agent 가 **공유 bearer token** 으로 인증한다 (Helm 이 생성·persist 하는 Secret, 양쪽에 주입). 토큰 없는 요청은 `401` 로 거절하고, auth 가 켜져 있는데 토큰이 비어 있으면 agent 는 인증 없이 열지 않고 기동을 거부한다(`--require-token`). 토큰 앞뒤 공백은 양쪽에서 다듬는다., 비교는 constant-time. 페이로드는 `MaxBytesReader` 로 제한한다. agent 는 매직 패킷 송신 외에 아무 권한도 없어, 토큰이 새어도 블래스트 반경은 "임의 MAC 으로 wake 패킷 송신" 에 그친다.
 - **onp-controller**: RBAC 최소화 — Pod / Node read, Pod eviction, `NodePool` / `Machine` read-write, Lease (leader election) read-write. Secret 접근은 Phase 1 에 없다 (WoL 은 자격 증명 불요).
 
 **미래 provider 의 credentials**. IPMI / Redfish provider 가 들어오면 BMC 자격 증명이 필요해진다. 원칙은 **credentials 는 provider 코드 안에 머무름** — 컨트롤러 핵심은 credential 을 보지 않는다. 구체적으로는 provider 별로 `Secret` 참조를 `Machine.spec.power.<provider>` 에 두고, provider 구현이 자기 Secret 만 읽는 RBAC 로 분리한다 (Phase 2 설계 시 구체화).
@@ -394,7 +394,7 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 운영자가 ONP 의 행동을 외부에서 관찰할 수 있어야 한다. 세 채널로 노출한다.
 
 **Metrics (`/metrics`, Prometheus 호환)**
-- `onp_nodes_total{pool, state}` — 풀별 상태별 노드 수 (gauge, scrape 시점 collector).
+- `onp_nodes_total{pool, state}` — 풀별 상태별 노드 수 (gauge, scrape 시점 collector). 각 풀은 6개 상태를 0 포함해 모두 내보내 "Ready 0대" 알람이 빈 결과가 되지 않는다. 풀에 속하지 않으면 `pool="<none>"`, 여러 풀에 매칭되면 `pool="<conflict>"`.
 - `onp_scale_up_latency_seconds` — pending 감지 → Node Ready 까지 (histogram).
 - `onp_power_on_total{provider, result}` — 전원 켜기 명령 발행 카운터. (대칭인 `onp_power_off_total` 은 Phase 1 에 없다 — 끄기 경로가 `provider.PowerOff` 가 아니라 shutdown-agent 의 로컬 `poweroff` 라, agent 가 `PoweringOff` Event 를 발행한다. provider 기반 hard-cut 이 들어오는 Phase 2 에서 추가.)
 - `onp_drain_failure_total{reason}` — drain/shutdown 이 깨끗이 끝나지 못한 횟수, 사유별 카운터 (`drain_timeout` | `shutdown_timeout`).
@@ -411,7 +411,7 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 - **PDB 존중**: Eviction API 를 사용 — `kubectl drain` 과 동일한 동작.
 - **`minNodes` 하한**: 풀이 minNodes 아래로 내려가는 스케일 다운은 거절.
 - **`maxConcurrent`**: 풀당 동시에 Draining 상태인 노드 수 제한 (기본 1).
-- **`onp.io/do-not-disrupt` 어노테이션**: Node 또는 Pod 단위 opt-out. 어노테이션이 붙은 Pod 가 있으면 그 노드는 스케일 다운 후보에서 제외.
+- **`onp.io/do-not-disrupt` 어노테이션**: Node 또는 Pod 단위 opt-out. 어노테이션이 붙은 Pod 가 있으면 — DaemonSet·static Pod 포함 — 그 노드는 스케일 다운 후보에서 제외. 수동 drain 은 그런 Pod 를 evict 하지 않고(force 제외), 남아 있는 동안 노드를 끄지 않아 drain timeout 으로 `Failed` 가 된다.
 - **`drain.timeoutSeconds`**: 설정 가능. 기본 300s.
 - **`drain.force`**: 기본 `false`. timeout 시 멈춤. `true` 는 NodePool 단위 명시적 opt-in.
 

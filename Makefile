@@ -13,7 +13,7 @@ RBAC_DIR := config/rbac
 # appVersion (charts/onp/Chart.yaml) so a chart release and its images move
 # together. Override either: make docker-push REGISTRY=... TAG=...
 REGISTRY ?= ghcr.io/zzzinho
-TAG ?= 0.7.0
+TAG ?= 0.7.1
 PLATFORM ?= linux/amd64
 
 # Per-image buildx flags. shutdown-agent needs the alpine runtime-privileged
