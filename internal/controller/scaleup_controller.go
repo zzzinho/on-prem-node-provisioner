@@ -103,6 +103,10 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.List(ctx, &pools); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list nodepools: %w", err)
 	}
+	memberships, err := poolMemberships(ctx, r.Client, pools.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Walk every pool's members, fit-checking each against a synthetic Node that
 	// describes how the Machine will look once Ready. We track, across all pools:
@@ -157,6 +161,12 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// Only an Off Machine not yet asked to wake is a candidate; one whose
 			// power-on keeps failing already carries the request.
 			if m.Status.State != v1alpha1.MachineStateOff || wakeRequested(m) {
+				continue
+			}
+			// A Machine in more than one pool has no single policy to wake it under
+			// (whose maxNodes, whose template?); hold it until the overlap is fixed.
+			if memberships[m.Name] > 1 {
+				logger.V(1).Info("skip machine matching several pools", "machine", m.Name)
 				continue
 			}
 			// A fitting Off member, but the pool's guards may forbid waking it.
@@ -317,6 +327,25 @@ func smallestCandidate(candidates []wakeCandidate) wakeCandidate {
 		return a.Name < b.Name
 	})
 	return candidates[0]
+}
+
+// poolMemberships counts, per Machine name, how many of pools select it.
+func poolMemberships(ctx context.Context, c client.Client, pools []v1alpha1.NodePool) (map[string]int, error) {
+	counts := map[string]int{}
+	for i := range pools {
+		selector, err := metav1.LabelSelectorAsSelector(&pools[i].Spec.MachineSelector)
+		if err != nil {
+			continue
+		}
+		var machines v1alpha1.MachineList
+		if err := c.List(ctx, &machines, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+			return nil, fmt.Errorf("list machines for pool %q: %w", pools[i].Name, err)
+		}
+		for j := range machines.Items {
+			counts[machines.Items[j].Name]++
+		}
+	}
+	return counts, nil
 }
 
 // poolAtCap reports whether waking another member of this pool would exceed its

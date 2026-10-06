@@ -1460,3 +1460,57 @@ func TestReconcileBootingFailsOnRejectedTemplate(t *testing.T) {
 		t.Errorf("Ready condition = %+v, want reason %s", cond, reasonTemplateRejected)
 	}
 }
+
+// TestDrainPolicyConservativeOnPoolConflict: a Machine matching two pools drains
+// under the most conservative reading of both — never force, the shortest
+// budget — whatever order the pools are listed in.
+func TestDrainPolicyConservativeOnPoolConflict(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	m.Labels = map[string]string{"pool": "a", "dup": "yes"}
+	forcing := nodePool("pool-a", map[string]string{"pool": "a"}, ptrInt32(600))
+	forcing.Spec.Drain.Force = true
+	strict := nodePool("pool-b", map[string]string{"dup": "yes"}, ptrInt32(60))
+	f := newFixture(t, m, forcing, strict)
+
+	timeout, force, err := f.r.drainPolicy(context.Background(), m)
+	if err != nil {
+		t.Fatalf("drainPolicy() error: %v", err)
+	}
+	if force {
+		t.Error("force = true, want false when the pools disagree")
+	}
+	if timeout != 60*time.Second {
+		t.Errorf("timeout = %v, want the shortest budget 60s", timeout)
+	}
+}
+
+// TestReconcileBootingSkipsPoolTemplateOnConflict: a Machine matching two pools
+// gets neither pool's template on the Node — only its own labels — and a
+// PoolConflict Event, instead of whichever template the cache listed first.
+func TestReconcileBootingSkipsPoolTemplateOnConflict(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	m.Labels = map[string]string{"pool": "a", "dup": "yes"}
+	m.Spec.Labels = map[string]string{"team": "a"}
+	poolA := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
+	poolA.Spec.Template.Labels = map[string]string{"from": "a"}
+	poolB := nodePool("pool-b", map[string]string{"dup": "yes"}, nil)
+	poolB.Spec.Template.Labels = map[string]string{"from": "b"}
+	f := newFixture(t, m, poolA, poolB, readyNode("node-a"))
+
+	f.reconcile(t)
+
+	labels := f.getNode(t, "node-a").Labels
+	if _, ok := labels["from"]; ok {
+		t.Errorf("pool template label applied (from=%q), want none on conflict", labels["from"])
+	}
+	if labels["team"] != "a" {
+		t.Errorf("team label = %q, want the Machine's own label applied", labels["team"])
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonPoolConflict)
+}

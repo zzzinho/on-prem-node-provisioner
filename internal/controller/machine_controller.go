@@ -741,40 +741,64 @@ func (r *MachineReconciler) shutdownTimedOut(m *v1alpha1.Machine) bool {
 }
 
 // drainPolicy resolves the drain budget and force flag for a Machine from its
-// NodePool's drain spec in a single pool lookup: drain.timeoutSeconds (falling
-// back to defaultDrainTimeout) and drain.force (default false). The first matching
-// pool wins; pool overlap is a conflict surfaced elsewhere, not resolved here.
+// NodePool's drain spec: drain.timeoutSeconds (falling back to
+// defaultDrainTimeout) and drain.force (default false). A Machine matching more
+// than one pool gets the most conservative reading of all of them — never force,
+// stop at the shortest budget — rather than whichever pool happened to list
+// first.
 func (r *MachineReconciler) drainPolicy(ctx context.Context, m *v1alpha1.Machine) (timeout time.Duration, force bool, err error) {
-	pool, err := poolForMachine(ctx, r.Client, m)
+	pool, conflict, err := poolForMachine(ctx, r.Client, m)
 	if err != nil {
 		return 0, false, err
 	}
-	timeout = defaultDrainTimeout
-	if pool != nil {
-		if pool.Spec.Drain.TimeoutSeconds != nil {
-			timeout = time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second
-		}
-		force = pool.Spec.Drain.Force
+	if len(conflict) > 0 {
+		return conservativeDrainTimeout(conflict), false, nil
 	}
+	timeout, force = poolDrainPolicy(pool)
 	return timeout, force, nil
 }
 
-// poolForMachine returns the first NodePool whose machineSelector matches the
-// Machine's labels, or nil when none match. It mirrors NodePoolReconciler's
-// selector logic (metav1.LabelSelectorAsSelector + a labels.Set match); the pool
-// count is assumed small, so a full list per reconcile is acceptable. The drain
-// (timeout resolution) path uses it; a Machine matching more than one pool is a
-// conflict the scale-down path surfaces and holds on (matchingPools), so first
-// match here only ever bounds an operator-triggered manual drain.
-func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (*v1alpha1.NodePool, error) {
+// poolDrainPolicy reads one pool's drain spec; a nil pool yields the defaults.
+func poolDrainPolicy(pool *v1alpha1.NodePool) (time.Duration, bool) {
+	if pool == nil {
+		return defaultDrainTimeout, false
+	}
+	timeout := defaultDrainTimeout
+	if pool.Spec.Drain.TimeoutSeconds != nil {
+		timeout = time.Duration(*pool.Spec.Drain.TimeoutSeconds) * time.Second
+	}
+	return timeout, pool.Spec.Drain.Force
+}
+
+// conservativeDrainTimeout returns the shortest drain budget across pools: a
+// drain that cannot finish stops — uncordon, Failed — at the earliest point any
+// of them allows.
+func conservativeDrainTimeout(pools []v1alpha1.NodePool) time.Duration {
+	shortest, _ := poolDrainPolicy(&pools[0])
+	for i := 1; i < len(pools); i++ {
+		if t, _ := poolDrainPolicy(&pools[i]); t < shortest {
+			shortest = t
+		}
+	}
+	return shortest
+}
+
+// poolForMachine returns the NodePool whose machineSelector matches the Machine,
+// or nil when none does. When more than one matches it returns them all as
+// conflict and no pool: the caller must not pick one (DESIGN.md 3.2).
+func poolForMachine(ctx context.Context, c client.Client, m *v1alpha1.Machine) (pool *v1alpha1.NodePool, conflict []v1alpha1.NodePool, err error) {
 	pools, err := matchingPools(ctx, c, m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if len(pools) == 0 {
-		return nil, nil
+	switch len(pools) {
+	case 0:
+		return nil, nil, nil
+	case 1:
+		return &pools[0], nil, nil
+	default:
+		return nil, pools, nil
 	}
-	return &pools[0], nil
 }
 
 // matchingPools returns every NodePool whose machineSelector matches the Machine's
@@ -798,6 +822,9 @@ func matchingPools(ctx context.Context, c client.Client, m *v1alpha1.Machine) ([
 			matched = append(matched, pools.Items[i])
 		}
 	}
+	// The cache lists in map order; sort so every caller sees the same pools in the
+	// same order on every reconcile.
+	sort.Slice(matched, func(a, b int) bool { return matched[a].Name < matched[b].Name })
 	return matched, nil
 }
 
@@ -821,9 +848,14 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 	if m.Spec.NodeName == "" {
 		return nil
 	}
-	pool, err := poolForMachine(ctx, r.Client, m)
+	pool, conflict, err := poolForMachine(ctx, r.Client, m)
 	if err != nil {
 		return err
+	}
+	if len(conflict) > 0 {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonPoolConflict,
+			"Machine %q matches %d NodePools (%s); applying only its own labels, no pool template, until the overlap is resolved",
+			m.Name, len(conflict), poolNames(conflict))
 	}
 	desiredLabels := map[string]string{}
 	if pool != nil {

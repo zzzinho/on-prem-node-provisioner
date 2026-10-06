@@ -202,6 +202,21 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 			wantEvent: true,
 		},
 		{
+			name: "machine matching two pools is held; a single-pool machine is woken instead",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				// Smaller, so best-fit would pick it were it not in two pools.
+				scaleMachine("conflicted", map[string]string{"onp.io/pool": "gpu", "dup": "yes"}, "2", "4Gi", v1alpha1.MachineStateOff),
+				scaleMachine("single", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				&v1alpha1.NodePool{
+					ObjectMeta: metav1.ObjectMeta{Name: "dup"},
+					Spec:       v1alpha1.NodePoolSpec{MachineSelector: metav1.LabelSelector{MatchLabels: map[string]string{"dup": "yes"}}},
+				},
+			},
+			wantWoken: []string{"single"},
+			wantEvent: true,
+		},
+		{
 			name: "machine outside any pool selector is not considered",
 			pod:  pendingPod("1", "1Gi", true),
 			machines: []client.Object{
