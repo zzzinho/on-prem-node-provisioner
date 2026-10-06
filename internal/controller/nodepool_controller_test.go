@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -149,5 +151,28 @@ func TestPoolsForMachineMatchesByLabel(t *testing.T) {
 				t.Errorf("poolsForMachine matched gpu = %v, want %v (reqs=%v)", got, tt.wantPool, reqs)
 			}
 		})
+	}
+}
+
+// TestNodePoolInvalidSelectorReportsEvent: a malformed machineSelector is
+// reported on the pool as an InvalidSelector Warning and the reconcile stops
+// without an error — a requeue cannot fix the spec.
+func TestNodePoolInvalidSelectorReportsEvent(t *testing.T) {
+	pool := gpuPool()
+	pool.Spec.MachineSelector = metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+		Key: "onp.io/pool", Operator: "Foo", Values: []string{"gpu"},
+	}}}
+	r, _ := newPoolReconciler(t, pool)
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "gpu"}}); err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil (an invalid spec does not requeue)", err)
+	}
+	select {
+	case e := <-r.Recorder.(*record.FakeRecorder).Events:
+		if !strings.Contains(e, "InvalidSelector") {
+			t.Errorf("event = %q, want InvalidSelector", e)
+		}
+	default:
+		t.Error("no InvalidSelector event recorded")
 	}
 }

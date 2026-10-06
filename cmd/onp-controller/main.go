@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -101,7 +102,7 @@ func main() {
 	// shared bearer token the wol-agent demands on /wake; empty means the agent
 	// runs unauthenticated and the client sends no Authorization header.
 	var wolOpts []wol.ClientOption
-	if token := os.Getenv("ONP_WOL_AGENT_TOKEN"); token != "" {
+	if token := strings.TrimSpace(os.Getenv("ONP_WOL_AGENT_TOKEN")); token != "" {
 		wolOpts = append(wolOpts, wol.WithToken(token))
 	}
 	registry := power.NewRegistry()

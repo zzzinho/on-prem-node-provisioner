@@ -1224,6 +1224,28 @@ func TestReconcileDrainingTimeoutLeavesOperatorCordon(t *testing.T) {
 	if n := f.getNode(t, "node-a"); !n.Spec.Unschedulable {
 		t.Error("operator cordon lifted on timeout, want preserved (only ONP's own cordon is lifted)")
 	}
+	for _, e := range f.events(t) {
+		if strings.Contains(e, reasonDrainTimeout) && !strings.Contains(e, "left as is") {
+			t.Errorf("event = %q, want it to say the operator's cordon was left as is", e)
+		}
+	}
+}
+
+// TestReconcileReadyDropsStaleCordonMarker: a cordon marker left on a Node that
+// is schedulable again is removed, so a later operator cordon is not mistaken for
+// ONP's and lifted by the next wake.
+func TestReconcileReadyDropsStaleCordonMarker(t *testing.T) {
+	t.Parallel()
+
+	node := readyNode("node-a")
+	node.Annotations = map[string]string{v1alpha1.AnnotationCordonedByONP: "true"}
+	f := newFixture(t, machine(v1alpha1.MachineStateReady, nil), node)
+
+	f.reconcile(t)
+
+	if _, marked := f.getNode(t, "node-a").Annotations[v1alpha1.AnnotationCordonedByONP]; marked {
+		t.Error("stale cordon marker kept on a schedulable Node, want removed")
+	}
 }
 
 // TestReconcileOffTidiesStaleDrainNow: a drain-now left on an Off Machine (set by
@@ -1513,4 +1535,28 @@ func TestReconcileBootingSkipsPoolTemplateOnConflict(t *testing.T) {
 		t.Errorf("team label = %q, want the Machine's own label applied", labels["team"])
 	}
 	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonPoolConflict)
+}
+
+// TestReconcileDrainingStallsOnDoNotDisruptDaemonSetPod: a DaemonSet pod marked
+// do-not-disrupt is never evicted, and it keeps the drain from handing the node
+// to the power-off leg — the drain stalls into its timeout instead of powering
+// the node off under the pod.
+func TestReconcileDrainingStallsOnDoNotDisruptDaemonSetPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	ds := doNotDisruptPod("backup-agent", "node-a")
+	ds.OwnerReferences = []metav1.OwnerReference{{Kind: "DaemonSet", Name: "backup"}}
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), ds)
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none (DaemonSet pods are not drained)", f.evicted)
+	}
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateDraining {
+		t.Errorf("state = %q, want %q while a do-not-disrupt pod remains", got, v1alpha1.MachineStateDraining)
+	}
 }

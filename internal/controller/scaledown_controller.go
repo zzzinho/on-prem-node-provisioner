@@ -71,9 +71,21 @@ type ScaleDownReconciler struct {
 	// and the fresh cooldown anchor, and the cache may not yet reflect a write made
 	// a moment earlier. main.go wires mgr.GetAPIReader().
 	APIReader client.Reader
+
+	// holds remembers, per Machine, the hold message last announced as an Event,
+	// and heldThisPass whether the reconcile in progress announced one. A hold is
+	// re-checked every scaleDownBlockedRequeue; announcing it each time would
+	// exhaust client-go's per-object Event budget (the spam filter keys on the
+	// object, not the reason) and silently drop the Draining / PoweredOff Events
+	// that follow.
+	//
+	// ponytail: plain fields, safe only with the default single worker; key them
+	// per request behind a lock if MaxConcurrentReconciles is ever raised.
+	holds        map[string]string
+	heldThisPass bool
 }
 
-// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch
@@ -88,6 +100,16 @@ type ScaleDownReconciler struct {
 // drain-now trigger), and it is cleared the moment the Machine is no longer a
 // scale-down candidate so a re-woken node never drains on a stale observation.
 func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	r.heldThisPass = false
+	res, err := r.reconcile(ctx, req)
+	if !r.heldThisPass {
+		// Not held this time: forget the last hold so the next one is announced.
+		delete(r.holds, req.Name)
+	}
+	return res, err
+}
+
+func (r *ScaleDownReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	var m v1alpha1.Machine
@@ -141,9 +163,9 @@ func (r *ScaleDownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 	if len(pools) > 1 {
-		r.Recorder.Eventf(&m, corev1.EventTypeWarning, reasonPoolConflict,
-			"Machine %q matches %d NodePools (%s); holding automatic scale-down until the overlap is resolved",
-			m.Name, len(pools), poolNames(pools))
+		r.announceHold(&m, corev1.EventTypeWarning, reasonPoolConflict,
+			fmt.Sprintf("Machine %q matches %d NodePools (%s); holding automatic scale-down until the overlap is resolved",
+				m.Name, len(pools), poolNames(pools)))
 		return ctrl.Result{}, r.clearEmptySince(ctx, &m)
 	}
 	var pool *v1alpha1.NodePool
@@ -227,9 +249,9 @@ func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.
 	// below its floor. keptOn includes this Machine (Ready, not yet draining), so
 	// draining it leaves keptOn-1; refuse when that would breach minNodes.
 	if keptOn <= pool.Spec.MinNodes {
-		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonScaleDownBlocked,
-			"not draining node %q: pool %q at its minNodes floor (%d kept on, min %d)",
-			m.Spec.NodeName, pool.Name, keptOn, pool.Spec.MinNodes)
+		r.announceHold(m, corev1.EventTypeNormal, reasonScaleDownBlocked,
+			fmt.Sprintf("not draining node %q: pool %q at its minNodes floor (%d kept on, min %d)",
+				m.Spec.NodeName, pool.Name, keptOn, pool.Spec.MinNodes))
 		return ctrl.Result{RequeueAfter: scaleDownBlockedRequeue}, nil
 	}
 
@@ -241,9 +263,9 @@ func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.
 		maxConcurrent = *pool.Spec.Disruption.MaxConcurrent
 	}
 	if scalingDown >= maxConcurrent {
-		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonScaleDownBlocked,
-			"deferring drain of node %q: pool %q already draining %d (maxConcurrent %d)",
-			m.Spec.NodeName, pool.Name, scalingDown, maxConcurrent)
+		r.announceHold(m, corev1.EventTypeNormal, reasonScaleDownBlocked,
+			fmt.Sprintf("deferring drain of node %q: pool %q already draining %d (maxConcurrent %d)",
+				m.Spec.NodeName, pool.Name, scalingDown, maxConcurrent))
 		return ctrl.Result{RequeueAfter: scaleDownBlockedRequeue}, nil
 	}
 
@@ -261,13 +283,27 @@ func (r *ScaleDownReconciler) triggerScaleDown(ctx context.Context, m *v1alpha1.
 	return ctrl.Result{}, nil
 }
 
+// announceHold emits a hold Event when a Machine's hold starts or its message
+// changes, and only records it while the same hold persists.
+func (r *ScaleDownReconciler) announceHold(m *v1alpha1.Machine, eventType, reason, message string) {
+	r.heldThisPass = true
+	if r.holds[m.Name] == message {
+		return
+	}
+	if r.holds == nil {
+		r.holds = map[string]string{}
+	}
+	r.holds[m.Name] = message
+	r.Recorder.Event(m, eventType, reason, message)
+}
+
 // nodeEmpty reports whether the node carries no workload, by the same definition
 // the drain uses for its empty check (DaemonSet, mirror, terminating and finished
 // pods do not count). A do-not-disrupt pod is workload, so a node carrying one is
 // never empty — which is how a Pod-level do-not-disrupt keeps its node out of
 // automatic scale-down without any special case here.
 func (r *ScaleDownReconciler) nodeEmpty(ctx context.Context, nodeName string) (bool, error) {
-	pods, err := workloadPodsOnNode(ctx, r.Client, nodeName)
+	pods, err := podsKeepingNodeOn(ctx, r.Client, nodeName)
 	if err != nil {
 		return false, err
 	}
@@ -539,7 +575,7 @@ func podEmptinessPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			pod, ok := e.Object.(*corev1.Pod)
-			return ok && pod.Spec.NodeName != "" && isWorkload(pod)
+			return ok && pod.Spec.NodeName != "" && keepsNodeOn(pod)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			pod, ok := e.Object.(*corev1.Pod)
@@ -552,9 +588,9 @@ func podEmptinessPredicate() predicate.Predicate {
 				return false
 			}
 			if oldPod.Spec.NodeName != newPod.Spec.NodeName {
-				return isWorkload(newPod)
+				return keepsNodeOn(newPod)
 			}
-			return isWorkload(oldPod) != isWorkload(newPod)
+			return keepsNodeOn(oldPod) != keepsNodeOn(newPod)
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}

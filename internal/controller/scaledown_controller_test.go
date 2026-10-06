@@ -587,6 +587,8 @@ func TestScaleDownMachinesForPod(t *testing.T) {
 func TestPodEmptinessPredicateUpdate(t *testing.T) {
 	succeeded := sdPod("app", "node-a", "")
 	succeeded.Status.Phase = corev1.PodSucceeded
+	protectedDS := sdPod("ds", "node-a", "DaemonSet")
+	protectedDS.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
 
 	tests := []struct {
 		name     string
@@ -597,6 +599,7 @@ func TestPodEmptinessPredicateUpdate(t *testing.T) {
 		{"daemonset pod bound to node", sdPod("ds", "", "DaemonSet"), sdPod("ds", "node-a", "DaemonSet"), false},
 		{"heartbeat on a bound pod", sdPod("app", "node-a", ""), sdPod("app", "node-a", ""), false},
 		{"pod reached terminal phase", sdPod("app", "node-a", ""), succeeded, true},
+		{"do-not-disrupt added to a daemonset pod", sdPod("ds", "node-a", "DaemonSet"), protectedDS, true},
 	}
 	pred := podEmptinessPredicate()
 	for _, tc := range tests {
@@ -679,5 +682,63 @@ func TestScaleDownMembersOfPool(t *testing.T) {
 
 	if len(reqs) != 1 || reqs[0].Name != "node-a" {
 		t.Fatalf("membersOfPool = %v, want one request for node-a", reqs)
+	}
+}
+
+// TestScaleDownAnnouncesHoldOnce: a hold re-checked every requeue is announced
+// once, not on every pass — so it cannot exhaust the Machine's Event budget —
+// and announced again once it has lifted and come back.
+func TestScaleDownAnnouncesHoldOnce(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.MinNodes = 1
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	rec := record.NewFakeRecorder(16)
+	r, cl := newScaleDownReconciler(t, rec, clk, m, pool)
+
+	for range 3 {
+		reconcileSD(t, r, "node-a")
+	}
+	if got := len(rec.Events); got != 1 {
+		t.Fatalf("events after three held passes = %d, want 1", got)
+	}
+	<-rec.Events
+
+	// The hold lifts (the Machine leaves Ready), then comes back.
+	setSDState := func(state v1alpha1.MachineState) {
+		got := getSDMachine(t, cl, "node-a")
+		got.Status.State = state
+		got.Status.EmptySince = &metav1.Time{Time: empty}
+		if err := cl.Status().Update(context.Background(), got); err != nil {
+			t.Fatalf("set state %s: %v", state, err)
+		}
+	}
+	setSDState(v1alpha1.MachineStateBooting)
+	reconcileSD(t, r, "node-a")
+	setSDState(v1alpha1.MachineStateReady)
+	reconcileSD(t, r, "node-a")
+
+	if got := len(rec.Events); got != 1 {
+		t.Errorf("events after the hold came back = %d, want 1 new announcement", got)
+	}
+}
+
+// TestScaleDownDoNotDisruptDaemonSetPodKeepsNode: a DaemonSet pod marked
+// do-not-disrupt keeps its node out of automatic scale-down, as the annotation's
+// contract promises for every pod — the empty timer never starts.
+func TestScaleDownDoNotDisruptDaemonSetPodKeepsNode(t *testing.T) {
+	after := 5 * time.Minute
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	ds := sdPod("backup-agent", "node-a", "DaemonSet")
+	ds.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	pool := whenEmptyPool("edge", &after)
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clocktesting.NewFakePassiveClock(scaleDownBase), m, ds, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
+		t.Fatal("emptySince stamped although a do-not-disrupt pod runs on the node")
 	}
 }

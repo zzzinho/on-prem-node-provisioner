@@ -55,6 +55,12 @@ func TestHandlerWake(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "EUI-64 MAC a magic packet cannot carry is 400, not a send failure",
+			method:     http.MethodPost,
+			body:       `{"macAddress":"02:00:5e:10:00:00:00:01"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "non-POST is 405",
 			method:     http.MethodGet,
 			body:       "",

@@ -22,9 +22,13 @@ func TestStateCollectorNodesTotal(t *testing.T) {
 	off := sdMachine("b", v1alpha1.MachineStateOff, nil)
 	unpooled := sdMachine("c", v1alpha1.MachineStateReady, nil)
 	unpooled.Labels = map[string]string{"pool": "other"} // matches no pool
+	// d matches edge and a second pool selecting "dup": counted under neither.
+	conflicted := sdMachine("d", v1alpha1.MachineStateReady, nil)
+	conflicted.Labels = map[string]string{"pool": "edge", "dup": "yes"}
+	dupPool := nodePool("dup", map[string]string{"dup": "yes"}, nil)
 
 	cl := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(pool, ready, off, unpooled).Build()
+		WithObjects(pool, dupPool, ready, off, unpooled, conflicted).Build()
 	c := NewStateCollector(cl)
 
 	expected := `
@@ -32,7 +36,18 @@ func TestStateCollectorNodesTotal(t *testing.T) {
 # TYPE onp_nodes_total gauge
 onp_nodes_total{pool="edge",state="Ready"} 1
 onp_nodes_total{pool="edge",state="Off"} 1
+onp_nodes_total{pool="edge",state="Booting"} 0
+onp_nodes_total{pool="edge",state="Draining"} 0
+onp_nodes_total{pool="edge",state="ShuttingDown"} 0
+onp_nodes_total{pool="edge",state="Failed"} 0
 onp_nodes_total{pool="<none>",state="Ready"} 1
+onp_nodes_total{pool="<conflict>",state="Ready"} 1
+onp_nodes_total{pool="dup",state="Off"} 0
+onp_nodes_total{pool="dup",state="Booting"} 0
+onp_nodes_total{pool="dup",state="Ready"} 0
+onp_nodes_total{pool="dup",state="Draining"} 0
+onp_nodes_total{pool="dup",state="ShuttingDown"} 0
+onp_nodes_total{pool="dup",state="Failed"} 0
 `
 	if err := testutil.CollectAndCompare(c, strings.NewReader(expected), "onp_nodes_total"); err != nil {
 		t.Error(err)

@@ -267,6 +267,21 @@
 - [x] **PV node affinity** — `scheduler.VolumeNodeAffinity`. PVC·PV 는 APIReader 로 get 만(RBAC get 추가, list/watch 없음).
 - [x] **검증** — 실클러스터 배포 (2026-10-06, `helm upgrade` 0.6.4→0.7.0, CRD 무변, ClusterRole 갱신). 세 컴포넌트 0.7.0 Running, `desktop` Ready 유지, 에러 로그 없음. 각 판정은 단위 테스트로 커버(되돌리면 해당 테스트 실패 확인). 참고: 검증 클러스터의 kube-apiserver 는 `--authorization-mode=AlwaysAllow` 라 RBAC 가 강제되지 않는다 — 차트 ClusterRole 은 생성된 `config/rbac/role.yaml` 과 rules 가 같음을 확인하는 것으로 갈음.
 
+### M5.12 — 관측성·보안·잡음 (차트 0.7.1)
+
+**왜**: 전수 점검(M5.9)의 마지막 그룹. 운영자가 상황을 잘못 읽게 만들거나, 인증·권한이 조용히 느슨해지던 경로.
+
+- [x] **wol-agent 토큰** — 양쪽 `strings.TrimSpace`, `--require-token`(차트는 auth 켜짐일 때 전달) 으로 빈 토큰이면 기동 거부. `helm template`·Argo CD 는 lookup 이 안 돼 렌더링마다 토큰을 새로 만들므로 `existingSecret` 을 쓰라는 주석.
+- [x] **RBAC 축소** — machines·nodes 는 get/list/watch/patch, nodepools 는 get/list/watch(쓰지 않던 `update` 제거). status 권한은 그대로.
+- [x] **보류 Event 반복** — `ScaleDownBlocked`·`PoolConflict` 는 보류가 시작·변경될 때만. client-go spam filter 가 객체 단위로 예산을 세서 이후 Draining·PoweredOff Event 가 버려지던 경로.
+- [x] **power-off 실패·잘못된 MAC** — shutdown-agent `PowerOffFailed` Event, wol-agent 는 6바이트가 아닌 MAC 에 400(502 아님), CRD `macAddress` 패턴 검증.
+- [x] **`onp_nodes_total`** — 풀 × 6개 상태 0 포함, 풀 충돌은 `<conflict>`.
+- [x] **drain timeout 메시지·cordon 마커** — 실제로 uncordon 했을 때만 "uncordoned", schedulable 노드의 남은 마커 정리.
+- [x] **do-not-disrupt 계약** — DaemonSet·static Pod 의 어노테이션도 노드를 지킨다(`keepsNodeOn`). 잘못된 machineSelector 는 `InvalidSelector` Event 후 멈춤.
+- **하지 않은 것**: drain 도중 Machine 을 지우면 ONP cordon 이 남는다. finalizer 로 막을 수 있지만 컨트롤러가 없을 때 Machine 삭제가 막히는 비용이 있어 보류 — Machine 을 지우기 전에 Draining/ShuttingDown 이 아닌지 확인한다.
+- **업그레이드**: Machine CRD 가 바뀌었다(macAddress 패턴). `kubectl apply -f charts/onp/crds/` 후 `helm upgrade`.
+- [x] **검증** — 실클러스터 배포 (2026-10-06, CRD apply → `helm upgrade` 0.7.0→0.7.1). wol-agent 가 `--require-token` 으로 기동, EUI-64 MAC 으로 Machine 생성 dry-run 이 CRD 패턴에 거부, `onp_nodes_total` 이 `on-demand` 풀의 6개 상태를 0 포함해 노출, `desktop` Ready 유지·에러 없음. 각 수정은 단위 테스트로 커버(되돌리면 해당 테스트 실패 확인).
+
 ---
 
 ## Phase 2 — 운영성

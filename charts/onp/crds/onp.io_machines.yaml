@@ -110,7 +110,10 @@ spec:
                           When empty the controller falls back to 255.255.255.255.
                         type: string
                       macAddress:
-                        description: MacAddress is the target NIC's MAC, e.g. "aa:bb:cc:dd:ee:ff".
+                        description: |-
+                          MacAddress is the target NIC's MAC, e.g. "aa:bb:cc:dd:ee:ff" — six octets,
+                          ':' or '-' separated, the only form a magic packet can carry.
+                        pattern: ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$
                         type: string
                     required:
                     - macAddress

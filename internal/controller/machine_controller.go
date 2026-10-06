@@ -140,10 +140,10 @@ type MachineReconciler struct {
 	APIReader client.Reader
 }
 
-// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -440,6 +440,12 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 	if !ready {
 		return r.reconcileReadyNodeLost(ctx, m)
 	}
+	// A cordon marker left on a schedulable Node — someone uncordoned by hand after
+	// a Failed drain — would make a later operator cordon read as ONP's, and the
+	// next wake would lift it. Drop it while the Node is up and in service.
+	if err := r.dropStaleCordonMarker(ctx, m.Spec.NodeName); err != nil {
+		return ctrl.Result{}, err
+	}
 	if m.Status.NotReadySince != nil {
 		// The Node recovered within the grace window; drop the stale loss anchor.
 		if err := r.clearNotReadySince(ctx, m); err != nil {
@@ -549,17 +555,22 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	// more pods, and the stop must uncordon so the operator can recover the node —
 	// but only the cordon ONP itself placed, never an operator's pre-existing one.
 	if r.drainTimedOut(m, timeout) {
-		if _, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName); err != nil {
+		uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		cordon := "uncordoned"
+		if !uncordoned {
+			cordon = "its cordon is not ONP's and was left as is"
 		}
 		m.Status.State = v1alpha1.MachineStateFailed
 		setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionFalse, reasonDrainTimeout,
-			fmt.Sprintf("Node %q did not drain within %s", m.Spec.NodeName, timeout))
+			fmt.Sprintf("Node %q did not drain within %s; %s", m.Spec.NodeName, timeout, cordon))
 		if err := r.Status().Update(ctx, m); err != nil {
 			return ctrl.Result{}, fmt.Errorf("fail machine %q on drain timeout: %w", m.Name, err)
 		}
 		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainTimeout,
-			"Node %q did not drain within %s; uncordoned and marked Failed", m.Spec.NodeName, timeout)
+			"Node %q did not drain within %s; %s; marked Failed", m.Spec.NodeName, timeout, cordon)
 		metrics.RecordDrainFailure(metrics.ReasonDrainTimeout)
 		return ctrl.Result{}, nil
 	}
@@ -581,7 +592,7 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	// below until the timeout above fails it, rather than powering the node off
 	// with the protected pod still on it. Evicted pods still terminating count too,
 	// so power-off waits out their graceful shutdown.
-	workload, err := r.workloadPods(ctx, m.Spec.NodeName)
+	workload, err := podsKeepingNodeOn(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list workload pods on node %q: %w", m.Spec.NodeName, err)
 	}
@@ -589,7 +600,7 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	if len(workload) == 0 {
 		// The cache says empty; the power-off leg is irreversible, so confirm with
 		// the API server — the cache may not yet show a pod bound a moment ago.
-		drained, err := noWorkloadOnNode(ctx, r.APIReader, m.Spec.NodeName)
+		drained, err := nothingKeepsNodeOn(ctx, r.APIReader, m.Spec.NodeName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1016,6 +1027,24 @@ func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unsc
 	return true, nil
 }
 
+// dropStaleCordonMarker removes the cordoned-by-onp marker from a Node that is
+// no longer cordoned. The marker only means something on a cordoned Node.
+func (r *MachineReconciler) dropStaleCordonMarker(ctx context.Context, nodeName string) error {
+	node, err := backingNode(ctx, r.Client, nodeName)
+	if err != nil || node == nil || node.Spec.Unschedulable {
+		return err
+	}
+	if _, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]; !marked {
+		return nil
+	}
+	patch := client.MergeFrom(node.DeepCopy())
+	delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
+	if err := r.Patch(ctx, node, patch); err != nil {
+		return fmt.Errorf("drop stale cordon marker from node %q: %w", nodeName, err)
+	}
+	return nil
+}
+
 // uncordonIfONPCordoned lifts a cordon ONP placed during a prior scale-down, so a
 // node brought back into service is schedulable again. It uncordons only nodes
 // carrying the onp.io/cordoned-by-onp marker, leaving an operator's manual cordon
@@ -1041,19 +1070,13 @@ func (r *MachineReconciler) uncordonIfONPCordoned(ctx context.Context, nodeName 
 	return true, nil
 }
 
-// workloadPods lists the pods scheduled on the node that keep it non-empty. See
-// workloadPodsOnNode for the exclusion rules.
-func (r *MachineReconciler) workloadPods(ctx context.Context, nodeName string) ([]corev1.Pod, error) {
-	return workloadPodsOnNode(ctx, r.Client, nodeName)
-}
-
-// workloadPodsOnNode lists the pods scheduled on the node and returns the ones that
-// make it non-empty (see isWorkload for the exclusion rules). The drain loop reads
-// it to decide when the node is empty enough to power off, and the scale-down path
-// reads it to decide whether the node is idle — so a node is detected "empty" by
-// exactly the condition the drain later confirms. What an unforced drain may
-// actually evict is the narrower isDrainable subset. nodeName "" yields no pods.
-func workloadPodsOnNode(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
+// podsKeepingNodeOn lists the pods scheduled on the node that keep it from being
+// powered off (see keepsNodeOn). The drain loop reads it to decide when the node
+// is empty enough to power off, and the scale-down path reads it to decide
+// whether the node is idle — so a node is detected "empty" by exactly the
+// condition the drain later confirms. What an unforced drain may actually evict
+// is the narrower isDrainable subset. nodeName "" yields no pods.
+func podsKeepingNodeOn(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
 	if nodeName == "" {
 		return nil, nil
 	}
@@ -1061,13 +1084,26 @@ func workloadPodsOnNode(ctx context.Context, c client.Client, nodeName string) (
 	if err := c.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
 		return nil, err
 	}
-	workload := make([]corev1.Pod, 0, len(pods.Items))
+	kept := make([]corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
-		if isWorkload(&pods.Items[i]) {
-			workload = append(workload, pods.Items[i])
+		if keepsNodeOn(&pods.Items[i]) {
+			kept = append(kept, pods.Items[i])
 		}
 	}
-	return workload, nil
+	return kept, nil
+}
+
+// keepsNodeOn reports whether a pod keeps its node from being powered off: it is
+// workload (see isWorkload), or it is any unfinished pod — a DaemonSet or static
+// pod included — carrying do-not-disrupt, which the annotation's contract honors
+// on every pod. A drain never evicts the latter (they are not drainable), so such
+// a node stalls and times out into Failed rather than going down under the pod.
+func keepsNodeOn(pod *corev1.Pod) bool {
+	if isWorkload(pod) {
+		return true
+	}
+	finished := pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+	return !finished && hasDoNotDisrupt(pod)
 }
 
 // evictPod issues one eviction through the injected Evict func, or the
