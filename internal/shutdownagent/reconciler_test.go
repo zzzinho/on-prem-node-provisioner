@@ -3,7 +3,9 @@ package shutdownagent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -237,5 +239,77 @@ func drainEvents(rec *record.FakeRecorder) bool {
 		default:
 			return got
 		}
+	}
+}
+
+// shuttingDownSince builds a ShuttingDown Machine for this node whose episode
+// began at at.
+func shuttingDownSince(at time.Time) *v1alpha1.Machine {
+	m := machine("node-a", thisNode, v1alpha1.MachineStateShuttingDown)
+	m.Status.ShutdownStartTime = &metav1.Time{Time: at}
+	return m
+}
+
+// TestReconcilePowersOffEachEpisode: a later ShuttingDown episode — the node came
+// back and was drained again — powers off again; only a re-delivery of the same
+// episode is skipped.
+func TestReconcilePowersOffEachEpisode(t *testing.T) {
+	t.Parallel()
+
+	first := time.Now().Truncate(time.Second)
+	f := newFixture(t, nil, shuttingDownSince(first))
+	f.reconcile(t, "node-a")
+	f.reconcile(t, "node-a")
+
+	var m v1alpha1.Machine
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: "node-a"}, &m); err != nil {
+		t.Fatalf("get machine: %v", err)
+	}
+	m.Status.ShutdownStartTime = &metav1.Time{Time: first.Add(time.Hour)}
+	if err := f.r.Update(context.Background(), &m); err != nil {
+		t.Fatalf("start second episode: %v", err)
+	}
+	f.reconcile(t, "node-a")
+
+	if *f.calls != 2 {
+		t.Errorf("PowerOff calls = %d, want 2 (once per episode)", *f.calls)
+	}
+}
+
+// TestReconcileSkipsWhenHostBootedAfterRequest: a host that booted after the
+// power-off was requested is not powered off again — the agent restarted on a
+// node that already came back up — and a PowerOffSkipped Event says why.
+func TestReconcileSkipsWhenHostBootedAfterRequest(t *testing.T) {
+	t.Parallel()
+
+	requested := time.Now().Truncate(time.Second)
+	f := newFixture(t, nil, shuttingDownSince(requested))
+	f.r.BootTime = func() (time.Time, error) { return requested.Add(2 * time.Minute), nil }
+
+	f.reconcile(t, "node-a")
+
+	if *f.calls != 0 {
+		t.Errorf("PowerOff calls = %d, want 0 on a host that booted after the request", *f.calls)
+	}
+	select {
+	case e := <-f.recorder.Events:
+		if !strings.Contains(e, reasonPowerOffSkipped) {
+			t.Errorf("event = %q, want %s", e, reasonPowerOffSkipped)
+		}
+	default:
+		t.Errorf("no %s event recorded", reasonPowerOffSkipped)
+	}
+}
+
+func TestParseBootTime(t *testing.T) {
+	got, err := parseBootTime(strings.NewReader("cpu  1 2 3\nbtime 1759622330\nprocesses 42\n"))
+	if err != nil {
+		t.Fatalf("parseBootTime() error = %v", err)
+	}
+	if want := time.Unix(1759622330, 0); !got.Equal(want) {
+		t.Errorf("parseBootTime() = %v, want %v", got, want)
+	}
+	if _, err := parseBootTime(strings.NewReader("cpu 1 2 3\n")); err == nil {
+		t.Error("parseBootTime() without btime: err = nil, want error")
 	}
 }

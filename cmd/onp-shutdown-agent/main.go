@@ -91,6 +91,7 @@ func main() {
 		Client:   mgr.GetClient(),
 		NodeName: nodeName,
 		PowerOff: shutdownagent.SystemctlPowerOff,
+		BootTime: shutdownagent.HostBootTime,
 		Recorder: mgr.GetEventRecorderFor("onp-shutdown-agent"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up shutdown reconciler")

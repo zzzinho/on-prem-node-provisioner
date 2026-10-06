@@ -196,7 +196,7 @@ metadata:
   labels:
     onp.io/pool: gpu
 spec:
-  nodeName: node-a01                # Phase 1은 metadata.name과 같음
+  nodeName: node-a01                # Phase 1은 metadata.name과 같음. 불변 (CEL)
 
   capacity:                         # 꺼져 있을 때의 fit 계산용 (source of truth)
     cpu: "16"
@@ -279,15 +279,17 @@ sequenceDiagram
     Ctrl->>Ctrl: minNodes / maxConcurrent / do-not-disrupt 체크
     Ctrl->>API: Machine.status.state = Draining
     Ctrl->>API: cordon Node
+    Ctrl->>Ctrl: 한 폴링 대기 (scheduler 가 cordon 을 반영하도록)
     Ctrl->>API: Eviction API (PDB 존중)
 
     alt drain 완료
+        Ctrl->>API: 노드의 파드 재확인 (캐시 우회)
         Ctrl->>API: Machine.status.state = ShuttingDown
         API-->>Shut: watch event
-        Shut->>OS: systemctl poweroff
+        Shut->>OS: systemctl poweroff (회차당 한 번)
         OS-->>API: Node NotReady
         API-->>Ctrl: Node NotReady event
-        Ctrl->>API: Machine.status.state = Off
+        Ctrl->>API: Machine.status.state = Off (NotReady 전이가 요청 이후일 때만)
     else drain timeout (force=false 기본)
         Ctrl->>API: uncordon Node
         Ctrl->>API: Machine.status.state = Failed + Event
@@ -424,6 +426,10 @@ ONP의 목표 — workload-aware proactive wake-up + 선언적 CRD + pluggable p
 | onp-wol-agent 도달 불가 | Wake HTTP 요청 실패 → backoff retry → 일정 횟수 후 Machine Event | 컨트롤러는 Booting 상태로 옮기지 않고 Off 유지 |
 | onp-shutdown-agent 도달 불가 / 노드가 안 꺼짐 | shutdown timeout(`--shutdown-timeout`, 기본 5분) 초과 시 `Failed` + Event(`onp_drain_failure_total{reason="shutdown_timeout"}`) | Phase 2: provider.PowerOff hard-cut fallback |
 | Ready 노드가 외부 요인으로 NotReady | grace(`--node-loss-grace-period`, 기본 1분) 후 `Off` + Event | scale-up 이 pending 파드로 자연 복구. flap 방지용 grace |
+| power-off 요청 전부터 NotReady (네트워크 단절 등) | `Off` 로 확정하지 않음 — NotReady 전이가 `shutdownStartTime` 이후여야 꺼진 증거. shutdown timeout 후 `Failed` | 켜진 채 단절된 노드를 "꺼짐" 으로 기록하지 않기 위함 |
+| ShuttingDown 중 노드가 다시 부팅 | shutdown-agent 가 다시 끄지 않음(`PowerOffSkipped` Event) → shutdown timeout 후 `Failed` | 호스트 부팅 시각(`/proc/stat` btime)이 요청보다 뒤인지로 판정 |
+| 같은 Node 를 가리키는 Machine 둘 이상 | 모든 전원 동작 정지 + `DuplicateNode` Event, 1분마다 재확인 | `spec.nodeName` 은 불변이라 생성 시점의 중복만 가능 |
+| drain 중 노드에 always-on 라벨 | drain 중단, ONP cordon 해제, `Ready` 로 복귀 + `DrainRefused` Event | shutdown-agent 도 always-on 노드에는 배치되지 않음 |
 
 원칙은 일관된다: **모호한 성공은 만들지 않는다**. 의심스러우면 `Failed` 로 옮기고 사람을 부른다.
 

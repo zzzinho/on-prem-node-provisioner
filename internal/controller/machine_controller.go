@@ -72,7 +72,14 @@ const (
 	reasonCapacityDrift   = "CapacityDrift"
 	reasonPoolConflict    = "PoolConflict"
 	reasonDrainRefused    = "DrainRefused"
+	reasonDuplicateNode   = "DuplicateNode"
+	reasonReservedLabel   = "ReservedLabel"
 )
+
+// duplicateNodeRecheck is how often a Machine held because another Machine
+// claims its Node re-checks, so removing the duplicate releases it without
+// waiting for an unrelated event.
+const duplicateNodeRecheck = time.Minute
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
 // while we wait for its Node to go NotReady, in case the Node watch misses the
@@ -125,6 +132,10 @@ type MachineReconciler struct {
 	// back to the controller-runtime Eviction subresource (wired in
 	// SetupWithManager).
 	Evict func(ctx context.Context, pod *corev1.Pod) error
+	// APIReader reads straight from the API server, bypassing the informer cache.
+	// The drain's last emptiness check goes through it before the node is handed
+	// to the irreversible power-off leg. main.go wires mgr.GetAPIReader().
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
@@ -146,6 +157,19 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Not found means the Machine was deleted between enqueue and now;
 		// nothing to reconcile.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// A Node claimed by more than one Machine has no single source of truth, so
+	// none of them may act on it until an operator removes the duplicate.
+	others, err := otherMachinesOnNode(ctx, r.Client, &m)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(others) > 0 {
+		r.Recorder.Eventf(&m, corev1.EventTypeWarning, reasonDuplicateNode,
+			"Node %q is also claimed by Machine(s) %s; holding all power actions until only one Machine claims it",
+			m.Spec.NodeName, strings.Join(others, ", "))
+		return ctrl.Result{RequeueAfter: duplicateNodeRecheck}, nil
 	}
 
 	switch m.Status.State {
@@ -463,6 +487,16 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	if err := r.removeDrainAnnotation(ctx, m); err != nil {
 		return ctrl.Result{}, err
 	}
+	// startDraining refuses an always-on Node when a drain starts; a label added
+	// while the drain runs — an operator stopping a mistaken drain — is honored
+	// on every pass too, before any more pods are touched.
+	alwaysOn, err := nodeAlwaysOn(ctx, r.Client, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if alwaysOn {
+		return r.abortDrain(ctx, m)
+	}
 	timeout, force, err := r.drainPolicy(ctx, m)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -487,8 +521,15 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.setCordon(ctx, m.Spec.NodeName, true); err != nil {
+	cordoned, err := r.setCordon(ctx, m.Spec.NodeName, true)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if cordoned {
+		// The scheduler may still bind a pod here until it sees the cordon; give it
+		// one poll before judging the node empty, or a pod placed a moment ago could
+		// ride the node down.
+		return ctrl.Result{RequeueAfter: drainPollInterval}, nil
 	}
 
 	// The node is empty for power-off once no workload pods remain — including any
@@ -503,6 +544,15 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	}
 
 	if len(workload) == 0 {
+		// The cache says empty; the power-off leg is irreversible, so confirm with
+		// the API server — the cache may not yet show a pod bound a moment ago.
+		drained, err := noWorkloadOnNode(ctx, r.APIReader, m.Spec.NodeName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !drained {
+			return ctrl.Result{RequeueAfter: drainPollInterval}, nil
+		}
 		// Node is empty: hand off to the power-off leg. Leave it cordoned — it is
 		// on its way down, and reconcileShuttingDown + the agent finish it. Anchor
 		// the shutdown timeout from here so a power-off that never lands fails
@@ -543,6 +593,27 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	return ctrl.Result{RequeueAfter: drainPollInterval}, nil
 }
 
+// abortDrain stops a drain whose Node turned out to be always-on: it lifts the
+// cordon ONP placed and returns the Machine to Ready. Pods already evicted stay
+// evicted — the scheduler places them again — but nothing else is touched and
+// the node is never powered off.
+func (r *MachineReconciler) abortDrain(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	if _, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName); err != nil {
+		return ctrl.Result{}, err
+	}
+	m.Status.State = v1alpha1.MachineStateReady
+	m.Status.DrainStartTime = nil
+	setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionFalse, reasonDrainRefused,
+		fmt.Sprintf("Node %q is labeled %s=%s; drain stopped", m.Spec.NodeName, v1alpha1.LabelAlwaysOn, v1alpha1.LabelAlwaysOnValue))
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("return machine %q to Ready after refused drain: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainRefused,
+		"stopped draining Node %q: it is labeled %s=%s and must never be powered off; back to Ready",
+		m.Spec.NodeName, v1alpha1.LabelAlwaysOn, v1alpha1.LabelAlwaysOnValue)
+	return ctrl.Result{}, nil
+}
+
 // reconcileShuttingDown finalizes the power-off leg. The shutdown-agent issues
 // the host poweroff in response to this same ShuttingDown state (coordination is
 // by CRD watch, not RPC — DESIGN.md 3.3); the controller's job here is to observe
@@ -551,20 +622,26 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 // Until then we keep polling, because the Node going NotReady is the only signal
 // that the node actually went down.
 func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
+	var issuedAt time.Time
+	if m.Status.ShutdownStartTime != nil {
+		issuedAt = m.Status.ShutdownStartTime.Time
 	}
-	if ready {
-		// Poweroff not observed yet. If the node has not gone down within the
-		// shutdown budget the power-off did not land (the agent never ran, or the
-		// board powered itself back on) — fail rather than poll forever. The node is
+	down, err := nodeWentDownSince(ctx, r.Client, m.Spec.NodeName, issuedAt)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !down {
+		// Power-off not observed yet: the node is still Ready, or it was already
+		// NotReady before the power-off was issued, which proves nothing. If it has
+		// not gone down within the shutdown budget the power-off did not land (the
+		// agent never ran, the board powered itself back on, or the node is cut off
+		// while still running) — fail rather than poll forever or guess. The node is
 		// left cordoned for the operator to inspect.
 		if r.shutdownTimedOut(m) {
 			m.Status.State = v1alpha1.MachineStateFailed
 			m.Status.ShutdownStartTime = nil
 			setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonShutdownTimeout,
-				fmt.Sprintf("Node %q still Ready %s after power-off was issued", m.Spec.NodeName, r.ShutdownTimeout))
+				fmt.Sprintf("Node %q not seen going NotReady within %s after power-off was issued", m.Spec.NodeName, r.ShutdownTimeout))
 			if err := r.Status().Update(ctx, m); err != nil {
 				return ctrl.Result{}, fmt.Errorf("fail machine %q on shutdown timeout: %w", m.Name, err)
 			}
@@ -609,22 +686,6 @@ func (r *MachineReconciler) nodeReady(ctx context.Context, nodeName string) (boo
 		}
 	}
 	return false, nil
-}
-
-// nodeAlwaysOn reports whether the named Node carries the always-on label. A
-// missing Node is not always-on: there is nothing ONP could power off.
-func nodeAlwaysOn(ctx context.Context, c client.Client, nodeName string) (bool, error) {
-	if nodeName == "" {
-		return false, nil
-	}
-	var node corev1.Node
-	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get node %q for always-on check: %w", nodeName, err)
-	}
-	return node.Labels[v1alpha1.LabelAlwaysOn] == v1alpha1.LabelAlwaysOnValue, nil
 }
 
 // bootTimedOut reports whether the Machine has been Booting longer than
@@ -751,6 +812,11 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 	for k, v := range m.Spec.Labels {
 		desiredLabels[k] = v
 	}
+	if dropped := dropReservedLabels(desiredLabels); len(dropped) > 0 {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonReservedLabel,
+			"not applying label(s) %s to Node %q: reserved for operators, ONP never writes them",
+			strings.Join(dropped, ", "), m.Spec.NodeName)
+	}
 	var desiredTaints []corev1.Taint
 	if pool != nil {
 		desiredTaints = pool.Spec.Template.Taints
@@ -846,23 +912,23 @@ func (r *MachineReconciler) capacityDrift(ctx context.Context, m *v1alpha1.Machi
 // since the node being unschedulable is all the drain needs. Uncordon clears the
 // state and drops the marker; callers gate it on the marker (uncordonIfONPCordoned)
 // so an operator's manual cordon is never lifted.
-func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) error {
+func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unschedulable bool) (bool, error) {
 	if nodeName == "" {
-		return nil
+		return false, nil
 	}
 	var node corev1.Node
 	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("get node %q to cordon: %w", nodeName, err)
+		return false, fmt.Errorf("get node %q to cordon: %w", nodeName, err)
 	}
 
 	if unschedulable {
 		if node.Spec.Unschedulable {
 			// Already cordoned (operator's, or ours from a prior reconcile). Do not
 			// claim it by stamping the marker.
-			return nil
+			return false, nil
 		}
 		patch := client.MergeFrom(node.DeepCopy())
 		node.Spec.Unschedulable = true
@@ -871,22 +937,22 @@ func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unsc
 		}
 		node.Annotations[v1alpha1.AnnotationCordonedByONP] = "true"
 		if err := r.Patch(ctx, &node, patch); err != nil {
-			return fmt.Errorf("cordon node %q: %w", nodeName, err)
+			return false, fmt.Errorf("cordon node %q: %w", nodeName, err)
 		}
-		return nil
+		return true, nil
 	}
 
 	_, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]
 	if !node.Spec.Unschedulable && !marked {
-		return nil
+		return false, nil
 	}
 	patch := client.MergeFrom(node.DeepCopy())
 	node.Spec.Unschedulable = false
 	delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
 	if err := r.Patch(ctx, &node, patch); err != nil {
-		return fmt.Errorf("uncordon node %q: %w", nodeName, err)
+		return false, fmt.Errorf("uncordon node %q: %w", nodeName, err)
 	}
-	return nil
+	return true, nil
 }
 
 // uncordonIfONPCordoned lifts a cordon ONP placed during a prior scale-down, so a
@@ -908,7 +974,7 @@ func (r *MachineReconciler) uncordonIfONPCordoned(ctx context.Context, nodeName 
 	if _, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]; !marked {
 		return false, nil
 	}
-	if err := r.setCordon(ctx, nodeName, false); err != nil {
+	if _, err := r.setCordon(ctx, nodeName, false); err != nil {
 		return false, err
 	}
 	return true, nil

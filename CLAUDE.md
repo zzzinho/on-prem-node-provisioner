@@ -78,6 +78,12 @@
 - `WhenUnderutilized` 추가 = `disruption.consolidationPolicy` enum 확장만으로 끝나야 함.
 - 깨질 것 같으면 Phase 1 단계에서 미리 조정 (이 doc 의 API sketch 가 검증의 출발점).
 
+### 설계 원칙 (SRP / OCP)
+
+- **SRP (단일 책임)**: 함수·타입은 바뀌는 이유가 하나여야 한다. reconciler 는 "상태를 보고 다음 전이를 고르는" 일만 하고, 노드 조작(cordon·template), eviction, fit 계산, 전원 명령처럼 다른 이유로 바뀌는 일은 각자의 함수·패키지에 둔다. 새 가드·규칙은 기존 함수에 분기를 덧붙이지 말고 이름 있는 판정 함수로 분리해 호출한다.
+- **OCP (개방·폐쇄)**: 새 동작은 기존 코드를 고치지 않고 추가로 확장한다 — power provider 는 구현체 등록, 정책은 enum 확장, fit 조건은 판정 함수 추가로 끝나야 한다(위 "인터페이스 안정성"의 일반형).
+- 두 원칙은 Go 스타일 규칙과 함께 적용한다: 실제 확장 지점이 없는 곳에 구현체 하나짜리 interface·factory 를 미리 만들지 않는다.
+
 ### 관측성
 
 - `/metrics` 노출 (Prometheus 호환). 메트릭 이름은 `onp_` 접두사.

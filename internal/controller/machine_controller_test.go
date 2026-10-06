@@ -138,6 +138,14 @@ func newFixture(t *testing.T, objs ...client.Object) *reconcilerFixture {
 			}
 			return []string{pod.Spec.NodeName}
 		}).
+		// Mirror main.go's Machine index so the duplicate-Node guard resolves.
+		WithIndex(&v1alpha1.Machine{}, IndexMachineNodeName, func(o client.Object) []string {
+			m, ok := o.(*v1alpha1.Machine)
+			if !ok || m.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{m.Spec.NodeName}
+		}).
 		WithObjects(objs...).
 		Build()
 
@@ -156,6 +164,7 @@ func newFixture(t *testing.T, objs ...client.Object) *reconcilerFixture {
 		NodeLossGracePeriod: time.Minute,
 		Recorder:            record.NewFakeRecorder(16),
 		Clock:               fc,
+		APIReader:           cl,
 		// Stub Evict: the fake client's eviction subresource deletes the pod
 		// unconditionally and never returns the PDB-blocked TooManyRequests we
 		// must exercise, so the test drives eviction through this stub.
@@ -211,6 +220,29 @@ func TestReconcileOffWithWakeAnnotationPowersOn(t *testing.T) {
 	if m.Status.BootStartTime == nil {
 		t.Error("BootStartTime = nil, want set")
 	}
+}
+
+// TestReconcileHoldsMachineSharingNode: when two Machines claim one Node, neither
+// acts — a wake-now on one is not powered on — and a DuplicateNode Event says why.
+func TestReconcileHoldsMachineSharingNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateOff, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	dup := machine(v1alpha1.MachineStateOff, nil)
+	dup.Name = "node-a-copy"
+	f := newFixture(t, m, dup, notReadyNode("node-a"))
+
+	res := f.reconcile(t)
+
+	if f.provider.powerOnCalls != 0 {
+		t.Errorf("PowerOn calls = %d, want 0 while another Machine claims the Node", f.provider.powerOnCalls)
+	}
+	if res.RequeueAfter != duplicateNodeRecheck {
+		t.Errorf("RequeueAfter = %s, want %s so removing the duplicate releases the hold", res.RequeueAfter, duplicateNodeRecheck)
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonDuplicateNode)
 }
 
 func TestReconcileBootingNodeReadyBecomesReady(t *testing.T) {
@@ -283,6 +315,32 @@ func onpCordonedReadyNode(name string) *corev1.Node {
 // TestReconcileBootingUncordonsONPCordonedNode: a node ONP cordoned during a
 // prior scale-down is uncordoned (and the marker cleared) when it is woken back
 // to Ready, so it can host pods again.
+// TestReconcileBootingKeepsReservedLabel: a Machine label cannot write the
+// operator-only always-on label onto the Node — the Node keeps its own value, the
+// other labels still apply, and a ReservedLabel Event names the dropped key.
+func TestReconcileBootingKeepsReservedLabel(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	m.Spec.Labels = map[string]string{v1alpha1.LabelAlwaysOn: "false", "team": "a"}
+	node := readyNode("node-a")
+	node.Labels = map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue}
+	f := newFixture(t, m, node)
+
+	f.reconcile(t)
+
+	labels := f.getNode(t, "node-a").Labels
+	if labels[v1alpha1.LabelAlwaysOn] != v1alpha1.LabelAlwaysOnValue {
+		t.Errorf("always-on label = %q, want the operator's %q kept", labels[v1alpha1.LabelAlwaysOn], v1alpha1.LabelAlwaysOnValue)
+	}
+	if labels["team"] != "a" {
+		t.Errorf("team label = %q, want %q applied", labels["team"], "a")
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonReservedLabel)
+}
+
 func TestReconcileBootingUncordonsONPCordonedNode(t *testing.T) {
 	t.Parallel()
 
@@ -431,6 +489,60 @@ func TestReconcileShuttingDownNodeStillReadyKeepsPolling(t *testing.T) {
 // TestReconcileShuttingDownTimesOutFails (A1): a node that never goes NotReady
 // after power-off must not poll forever — once the shutdown budget elapses the
 // Machine is failed.
+// notReadyNodeSince returns a Node whose Ready condition turned False at at.
+func notReadyNodeSince(name string, at time.Time) *corev1.Node {
+	n := notReadyNode(name)
+	n.Status.Conditions[0].LastTransitionTime = metav1.NewTime(at)
+	return n
+}
+
+// TestReconcileShuttingDownOffOnceNodeGoesDown: a Node that turns NotReady after
+// the power-off was issued is the evidence it landed — the Machine goes Off.
+func TestReconcileShuttingDownOffOnceNodeGoesDown(t *testing.T) {
+	t.Parallel()
+
+	issued := time.Now().Truncate(time.Second)
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	m.Status.ShutdownStartTime = &metav1.Time{Time: issued}
+	f := newFixture(t, m, notReadyNodeSince("node-a", issued.Add(40*time.Second)))
+
+	f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateOff {
+		t.Errorf("state = %q, want %q", got, v1alpha1.MachineStateOff)
+	}
+}
+
+// TestReconcileShuttingDownIgnoresEarlierNotReady: a Node that was already
+// NotReady before the power-off was issued (cut off while running) does not prove
+// the power-off landed — the Machine keeps waiting and fails at the shutdown
+// timeout instead of reporting a power-off that may not have happened.
+func TestReconcileShuttingDownIgnoresEarlierNotReady(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateShuttingDown, nil)
+	f := newFixture(t, m, notReadyNodeSince("node-a", time.Now().Add(-time.Minute)))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.ShutdownStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed ShutdownStartTime: %v", err)
+	}
+
+	res := f.reconcile(t)
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateShuttingDown {
+		t.Fatalf("state = %q, want %q while the power-off is unconfirmed", got, v1alpha1.MachineStateShuttingDown)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("RequeueAfter = 0, want a poll while waiting")
+	}
+
+	f.clock.Step(6 * time.Minute)
+	f.reconcile(t)
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateFailed {
+		t.Errorf("state = %q, want %q at the shutdown timeout", got, v1alpha1.MachineStateFailed)
+	}
+}
+
 func TestReconcileShuttingDownTimesOutFails(t *testing.T) {
 	t.Parallel()
 
@@ -620,21 +732,26 @@ func TestReconcileDrainingEvictsAndMovesToShuttingDown(t *testing.T) {
 
 	f := newFixture(t, m, readyNode("node-a"), normalPod("app-1", "node-a"))
 
-	// First pass: node has one evictable pod. It should be cordoned, the pod
-	// evicted, and the Machine left Draining with a poll requeue.
+	// First pass: the node is cordoned and nothing else happens — the scheduler
+	// gets one poll to see the cordon before any emptiness judgement.
 	res := f.reconcile(t)
+	if res.RequeueAfter != drainPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v (settle after cordon)", res.RequeueAfter, drainPollInterval)
+	}
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none on the cordon pass", f.evicted)
+	}
+	if !f.getNode(t, "node-a").Spec.Unschedulable {
+		t.Error("node not cordoned, want unschedulable=true")
+	}
+
+	// Second pass: the pod is evicted and the Machine stays Draining.
+	res = f.reconcile(t)
 	if res.RequeueAfter != drainPollInterval {
 		t.Errorf("RequeueAfter = %v, want %v (eviction in flight)", res.RequeueAfter, drainPollInterval)
 	}
 	if len(f.evicted) != 1 || f.evicted[0] != "app-1" {
 		t.Errorf("evicted = %v, want [app-1]", f.evicted)
-	}
-	var node corev1.Node
-	if err := f.cl.Get(context.Background(), types.NamespacedName{Name: "node-a"}, &node); err != nil {
-		t.Fatalf("get node: %v", err)
-	}
-	if !node.Spec.Unschedulable {
-		t.Error("node not cordoned, want unschedulable=true")
 	}
 	if got := f.getMachine(t); got.Status.State != v1alpha1.MachineStateDraining {
 		t.Errorf("state = %q, want %q (still draining)", got.Status.State, v1alpha1.MachineStateDraining)
@@ -680,7 +797,7 @@ func TestReconcileDrainingExcludesUnevictablePods(t *testing.T) {
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	f := newFixture(t, m, readyNode("node-a"), dsPod, mirrorPod)
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), dsPod, mirrorPod)
 
 	f.reconcile(t)
 
@@ -736,6 +853,67 @@ func TestReconcileDrainingWaitsForTerminatingPod(t *testing.T) {
 	}
 }
 
+// TestReconcileDrainingAbortsOnAlwaysOnNode: an always-on label that appears
+// while a drain runs stops it — no eviction, the ONP cordon lifted, the Machine
+// back to Ready — so the node is never handed to the power-off leg.
+func TestReconcileDrainingAbortsOnAlwaysOnNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	node := onpCordonedReadyNode("node-a")
+	node.Labels = map[string]string{v1alpha1.LabelAlwaysOn: v1alpha1.LabelAlwaysOnValue}
+	f := newFixture(t, m, node, normalPod("app-1", "node-a"))
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none on an always-on node", f.evicted)
+	}
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateReady {
+		t.Errorf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateReady)
+	}
+	if got.Status.DrainStartTime != nil {
+		t.Error("DrainStartTime kept, want cleared")
+	}
+	if f.getNode(t, "node-a").Spec.Unschedulable {
+		t.Error("node still cordoned, want the ONP cordon lifted")
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonDrainRefused)
+}
+
+// TestReconcileDrainingConfirmsEmptyWithAPI: the cache says the node is empty
+// but the API server already holds a pod bound there — the drain keeps waiting
+// instead of handing a node with workload to the power-off leg.
+func TestReconcileDrainingConfirmsEmptyWithAPI(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"))
+	// A second fake client stands in for the API server, where a pod just bound
+	// to the node is already visible.
+	f.r.APIReader = fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithIndex(&corev1.Pod{}, IndexPodNodeName, func(o client.Object) []string {
+			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).
+		WithObjects(normalPod("just-bound", "node-a")).
+		Build()
+
+	res := f.reconcile(t)
+
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateDraining {
+		t.Errorf("state = %q, want %q while the API still shows a pod", got, v1alpha1.MachineStateDraining)
+	}
+	if res.RequeueAfter != drainPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, drainPollInterval)
+	}
+}
+
 func TestReconcileDrainingTimesOutUncordonsAndFails(t *testing.T) {
 	t.Parallel()
 
@@ -751,7 +929,7 @@ func TestReconcileDrainingTimesOutUncordonsAndFails(t *testing.T) {
 	if err := f.cl.Status().Update(context.Background(), m); err != nil {
 		t.Fatalf("seed DrainStartTime: %v", err)
 	}
-	if err := f.r.setCordon(context.Background(), "node-a", true); err != nil {
+	if _, err := f.r.setCordon(context.Background(), "node-a", true); err != nil {
 		t.Fatalf("pre-cordon node: %v", err)
 	}
 	f.clock.Step(61 * time.Second)
@@ -785,7 +963,7 @@ func TestReconcileDrainingBlockedEvictionStaysDraining(t *testing.T) {
 	start := metav1.NewTime(time.Now())
 	m.Status.DrainStartTime = &start
 
-	f := newFixture(t, m, readyNode("node-a"), normalPod("pdb-1", "node-a"))
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), normalPod("pdb-1", "node-a"))
 	// A PDB-blocked eviction comes back as TooManyRequests; the drain must treat
 	// it as expected, not as a failure.
 	f.evictErr = apierrors.NewTooManyRequests("disruption budget", 0)
@@ -849,7 +1027,7 @@ func TestReconcileDrainingForceEvictsDoNotDisruptPod(t *testing.T) {
 	pool := nodePool("pool-a", map[string]string{"pool": "a"}, nil)
 	pool.Spec.Drain.Force = true
 
-	f := newFixture(t, m, readyNode("node-a"), pool, doNotDisruptPod("protected-1", "node-a"))
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), pool, doNotDisruptPod("protected-1", "node-a"))
 
 	f.reconcile(t)
 
