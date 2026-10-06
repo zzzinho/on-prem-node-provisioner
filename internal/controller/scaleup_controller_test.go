@@ -55,6 +55,14 @@ func readyMachineSince(name string, lbls map[string]string, since time.Time) *v1
 	return m
 }
 
+// offNode builds the Node object a powered-off Machine leaves behind, adjusted by
+// edit.
+func offNode(name string, edit func(*corev1.Node)) *corev1.Node {
+	n := notReadyNode(name)
+	edit(n)
+	return n
+}
+
 // pendingPod builds an unbound Pending Pod requesting cpu/mem. When unsched is
 // true it carries the PodScheduled=False/Unschedulable condition that marks it a
 // scale-up candidate.
@@ -214,6 +222,70 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 				},
 			},
 			wantWoken: []string{"single"},
+			wantEvent: true,
+		},
+		{
+			name: "pod selecting kubernetes.io/os wakes a machine whose node carries it",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+				return p
+			}(),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) { n.Labels = map[string]string{"kubernetes.io/os": "linux"} }),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "pod selecting its node by hostname wakes it even with no Node labels known",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": "g1"}
+				return p
+			}(),
+			machines:  []client.Object{scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff)},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "machine whose node an operator cordoned is not woken",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) { n.Spec.Unschedulable = true }),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "machine whose node ONP cordoned is woken (the wake lifts it)",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) {
+					n.Spec.Unschedulable = true
+					n.Annotations = map[string]string{v1alpha1.AnnotationCordonedByONP: "true"}
+				}),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "operator NoSchedule taint on the node blocks the wake; lifecycle taints do not",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("tainted", gpu, "2", "4Gi", v1alpha1.MachineStateOff),
+				offNode("tainted", func(n *corev1.Node) {
+					n.Spec.Taints = []corev1.Taint{{Key: "maintenance", Effect: corev1.TaintEffectNoSchedule}}
+				}),
+				scaleMachine("down", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("down", func(n *corev1.Node) {
+					n.Spec.Taints = []corev1.Taint{{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}}
+				}),
+			},
+			wantWoken: []string{"down"},
 			wantEvent: true,
 		},
 		{

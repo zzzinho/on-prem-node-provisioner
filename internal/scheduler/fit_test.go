@@ -90,6 +90,22 @@ func TestFit(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "cordoned node does not fit",
+			pod:  pod(list("cpu", "1")),
+			node: func() *corev1.Node { n := node(ample(), nil, nil); n.Spec.Unschedulable = true; return n }(),
+			want: false,
+		},
+		{
+			name: "pod tolerating the unschedulable taint fits a cordoned node",
+			pod: func() *corev1.Pod {
+				p := pod(list("cpu", "1"))
+				p.Spec.Tolerations = []corev1.Toleration{{Key: corev1.TaintNodeUnschedulable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+				return p
+			}(),
+			node: func() *corev1.Node { n := node(ample(), nil, nil); n.Spec.Unschedulable = true; return n }(),
+			want: true,
+		},
+		{
 			name: "cpu request exceeds allocatable",
 			pod:  pod(list("cpu", "2")),
 			node: node(list("cpu", "1"), nil, nil),

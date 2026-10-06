@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -150,7 +153,11 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		for j := range machines.Items {
 			m := &machines.Items[j]
-			node := nodeForMachine(m, pool)
+			real, err := backingNode(ctx, r.Client, m.Spec.NodeName)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			node := nodeForMachine(m, pool, real)
 			if !scheduler.Fit(&pod, node).Fits {
 				continue
 			}
@@ -280,24 +287,35 @@ func (r *ScaleUpReconciler) requestWake(ctx context.Context, m *v1alpha1.Machine
 	return nil
 }
 
-// nodeForMachine builds the synthetic Node a Machine will present once Ready: its
-// declared Capacity becomes allocatable, its Node labels are the pool Template
-// labels overlaid by the Machine's own Labels (Machine wins on conflict — the
-// per-node label is the more specific intent), and the pool Template taints are
-// applied. scheduler.Fit reads only Allocatable, Labels and Taints, so that is
-// all this assembles.
-func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool) *corev1.Node {
-	labels := make(map[string]string, len(pool.Spec.Template.Labels)+len(m.Spec.Labels))
+// nodeForMachine builds the synthetic Node a Machine will present once Ready.
+// It starts from the real Node object when one exists — a powered-off node keeps
+// its Node object — because the labels the kubelet and node-feature discovery
+// put there (kubernetes.io/os, arch, GPU product labels) are back the moment it
+// boots, and an operator's cordon or taint survives the boot too. Over that come
+// the pool Template labels, then the Machine's own Labels (Machine wins on
+// conflict), and the Template taints. Lifecycle taints (node.kubernetes.io/*)
+// only describe the node being down and are dropped, as is a cordon ONP placed
+// itself, which the wake lifts. Its declared Capacity becomes allocatable.
+func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool, real *corev1.Node) *corev1.Node {
+	labels := map[string]string{corev1.LabelHostname: m.Spec.NodeName}
+	var taints []corev1.Taint
+	var cordoned bool
+	if real != nil {
+		for k, v := range real.Labels {
+			labels[k] = v
+		}
+		taints = persistentTaints(real.Spec.Taints)
+		_, onpCordon := real.Annotations[v1alpha1.AnnotationCordonedByONP]
+		cordoned = real.Spec.Unschedulable && !onpCordon
+	}
 	for k, v := range pool.Spec.Template.Labels {
 		labels[k] = v
 	}
 	for k, v := range m.Spec.Labels {
 		labels[k] = v
 	}
-
-	var taints []corev1.Taint
-	if len(pool.Spec.Template.Taints) > 0 {
-		taints = append(taints, pool.Spec.Template.Taints...)
+	for _, t := range pool.Spec.Template.Taints {
+		taints, _ = mergeTaint(taints, t)
 	}
 
 	return &corev1.Node{
@@ -305,11 +323,41 @@ func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool) *corev1.Node {
 			Name:   m.Spec.NodeName,
 			Labels: labels,
 		},
-		Spec: corev1.NodeSpec{Taints: taints},
+		Spec: corev1.NodeSpec{Taints: taints, Unschedulable: cordoned},
 		Status: corev1.NodeStatus{
 			Allocatable: m.Spec.Capacity,
 		},
 	}
+}
+
+// backingNode returns the named Node, or nil when it does not exist (a Machine
+// whose node never joined).
+func backingNode(ctx context.Context, c client.Client, nodeName string) (*corev1.Node, error) {
+	if nodeName == "" {
+		return nil, nil
+	}
+	var node corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get node %q: %w", nodeName, err)
+	}
+	return &node, nil
+}
+
+// persistentTaints returns the taints that will still be on the node once it
+// boots: everything but the node.kubernetes.io/* lifecycle taints the node
+// controller sets while a node is NotReady, unreachable or cordoned.
+func persistentTaints(taints []corev1.Taint) []corev1.Taint {
+	var kept []corev1.Taint
+	for _, t := range taints {
+		if strings.HasPrefix(t.Key, "node.kubernetes.io/") {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept
 }
 
 // smallestCandidate returns the candidate whose Machine is smallest by capacity,

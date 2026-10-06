@@ -6,6 +6,7 @@
 // Only predicates decidable without live cluster state are evaluated, because the
 // target node is OFF (zero running pods, a stale or empty kubelet Node.Status):
 //
+//   - the node is not cordoned (unless the Pod tolerates it),
 //   - resource requests fit the node's allocatable,
 //   - nodeSelector and required node affinity match the node's labels,
 //   - the Pod tolerates the node's NoSchedule / NoExecute taints.
@@ -44,7 +45,7 @@ type Predicate func(pod *corev1.Pod, node *corev1.Node) string
 
 // defaultPredicates are the rules every fit check applies, in order: the cheap
 // label and taint matches before the resource sums.
-var defaultPredicates = []Predicate{matchesNodeAffinity, toleratesHardTaints, fitsRequests}
+var defaultPredicates = []Predicate{schedulable, matchesNodeAffinity, toleratesHardTaints, fitsRequests}
 
 // Fit reports whether pod could schedule onto node, considering only the
 // predicates ONP can evaluate without live cluster state, plus any extra ones the
@@ -63,6 +64,20 @@ func Fit(pod *corev1.Pod, node *corev1.Node, extra ...Predicate) Result {
 		}
 	}
 	return Result{Fits: true}
+}
+
+// schedulable fails on a cordoned node unless the pod tolerates the unschedulable
+// taint (as DaemonSet pods do), mirroring kube-scheduler's NodeUnschedulable
+// plugin.
+func schedulable(pod *corev1.Pod, node *corev1.Node) string {
+	if !node.Spec.Unschedulable {
+		return ""
+	}
+	cordon := corev1.Taint{Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule}
+	if v1helper.TolerationsTolerateTaint(pod.Spec.Tolerations, &cordon) {
+		return ""
+	}
+	return "node is cordoned"
 }
 
 // matchesNodeAffinity checks nodeSelector + required nodeAffinity.
