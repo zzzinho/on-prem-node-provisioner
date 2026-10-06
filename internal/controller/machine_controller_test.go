@@ -18,6 +18,7 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/zzzinho/on-prem-node-provisioner/api/v1alpha1"
@@ -1246,7 +1247,7 @@ func TestReconcileBootingAppliesNodeTemplate(t *testing.T) {
 	if n.Labels["disk"] != "ssd" {
 		t.Errorf("node label disk = %q, want ssd (machine label overrides template)", n.Labels["disk"])
 	}
-	if !hasTaint(n.Spec.Taints, corev1.Taint{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}) {
+	if !containsTaint(n.Spec.Taints, corev1.Taint{Key: "dedicated", Value: "a", Effect: corev1.TaintEffectNoSchedule}) {
 		t.Errorf("node taints = %v, want template taint applied", n.Spec.Taints)
 	}
 }
@@ -1317,4 +1318,92 @@ func hasEvent(events []string, reason string) bool {
 // literal is malformed (it never is at call sites).
 func resourceQty(s string) resource.Quantity {
 	return resource.MustParse(s)
+}
+
+// containsTaint reports whether taints has an entry equal to t.
+func containsTaint(taints []corev1.Taint, t corev1.Taint) bool {
+	for _, have := range taints {
+		if have.Key == t.Key && have.Value == t.Value && have.Effect == t.Effect {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMergeTaint(t *testing.T) {
+	t.Parallel()
+
+	ns := corev1.Taint{Key: "onp.io/on-demand", Value: "true", Effect: corev1.TaintEffectPreferNoSchedule}
+	tests := []struct {
+		name        string
+		have        []corev1.Taint
+		add         corev1.Taint
+		want        []corev1.Taint
+		wantChanged bool
+	}{
+		{"absent is appended", nil, ns, []corev1.Taint{ns}, true},
+		{"identical is a no-op", []corev1.Taint{ns}, ns, []corev1.Taint{ns}, false},
+		{
+			"same key and effect replaces the value",
+			[]corev1.Taint{ns},
+			corev1.Taint{Key: ns.Key, Value: "yes", Effect: ns.Effect},
+			[]corev1.Taint{{Key: ns.Key, Value: "yes", Effect: ns.Effect}},
+			true,
+		},
+		{
+			"same key, other effect is a separate taint",
+			[]corev1.Taint{ns},
+			corev1.Taint{Key: ns.Key, Value: "true", Effect: corev1.TaintEffectNoSchedule},
+			[]corev1.Taint{ns, {Key: ns.Key, Value: "true", Effect: corev1.TaintEffectNoSchedule}},
+			true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := mergeTaint(append([]corev1.Taint(nil), tc.have...), tc.add)
+			if changed != tc.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("taints = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("taints[%d] = %v, want %v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestReconcileBootingFailsOnRejectedTemplate: when the API server rejects the
+// template patch as invalid — a configuration error no retry fixes — the Machine
+// fails with TemplateRejected instead of staying Booting forever, where it would
+// hold back every other wake for the same pod.
+func TestReconcileBootingFailsOnRejectedTemplate(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, nil)
+	start := metav1.Now()
+	m.Status.BootStartTime = &start
+	m.Spec.Labels = map[string]string{"gpu-model": "RTX 3090"}
+	f := newFixture(t, m, readyNode("node-a"))
+	f.r.Client = interceptor.NewClient(f.cl.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, isNode := obj.(*corev1.Node); isNode {
+				return apierrors.NewInvalid(corev1.SchemeGroupVersion.WithKind("Node").GroupKind(), obj.GetName(), nil)
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateFailed {
+		t.Fatalf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateFailed)
+	}
+	if cond := condition(got, v1alpha1.ConditionReady); cond == nil || cond.Reason != reasonTemplateRejected {
+		t.Errorf("Ready condition = %+v, want reason %s", cond, reasonTemplateRejected)
+	}
 }

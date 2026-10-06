@@ -56,24 +56,25 @@ const bootPollInterval = 15 * time.Second
 // Event reasons surfaced on Machine objects. Kept as constants so the strings
 // operators grep for stay stable.
 const (
-	reasonWaking          = "Waking"
-	reasonPowerOnFailed   = "PowerOnFailed"
-	reasonReady           = "Ready"
-	reasonBootTimeout     = "BootTimeout"
-	reasonUnknownProvider = "UnknownProvider"
-	reasonCannotPowerOn   = "CannotPowerOn"
-	reasonPoweredOff      = "PoweredOff"
-	reasonDraining        = "Draining"
-	reasonDrainSucceeded  = "DrainSucceeded"
-	reasonDrainTimeout    = "DrainTimeout"
-	reasonUncordoned      = "Uncordoned"
-	reasonShutdownTimeout = "ShutdownTimeout"
-	reasonNodeLost        = "NodeLost"
-	reasonCapacityDrift   = "CapacityDrift"
-	reasonPoolConflict    = "PoolConflict"
-	reasonDrainRefused    = "DrainRefused"
-	reasonDuplicateNode   = "DuplicateNode"
-	reasonReservedLabel   = "ReservedLabel"
+	reasonWaking           = "Waking"
+	reasonPowerOnFailed    = "PowerOnFailed"
+	reasonReady            = "Ready"
+	reasonBootTimeout      = "BootTimeout"
+	reasonUnknownProvider  = "UnknownProvider"
+	reasonCannotPowerOn    = "CannotPowerOn"
+	reasonPoweredOff       = "PoweredOff"
+	reasonDraining         = "Draining"
+	reasonDrainSucceeded   = "DrainSucceeded"
+	reasonDrainTimeout     = "DrainTimeout"
+	reasonUncordoned       = "Uncordoned"
+	reasonShutdownTimeout  = "ShutdownTimeout"
+	reasonNodeLost         = "NodeLost"
+	reasonCapacityDrift    = "CapacityDrift"
+	reasonPoolConflict     = "PoolConflict"
+	reasonDrainRefused     = "DrainRefused"
+	reasonDuplicateNode    = "DuplicateNode"
+	reasonReservedLabel    = "ReservedLabel"
+	reasonTemplateRejected = "TemplateRejected"
 )
 
 // duplicateNodeRecheck is how often a Machine held because another Machine
@@ -276,67 +277,90 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
 	if ready {
-		// Record the wake latency before clearing the anchor: power-on -> Ready.
-		if m.Status.BootStartTime != nil {
-			metrics.ObserveScaleUpLatency(r.Clock.Since(m.Status.BootStartTime.Time))
-		}
-		// A node ONP cordoned during a prior scale-down is being woken back into
-		// service; lift that cordon so it can host pods again. An operator's manual
-		// cordon (no onp.io/cordoned-by-onp marker) is left alone.
-		uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		// Stamp the pool Template + Machine labels/taints onto the real Node so it
-		// carries what the fit simulation assumed when it chose to wake this Machine
-		// (DESIGN.md 3.2). Without this a pod whose nodeSelector matches a Template
-		// label passes fit but never binds, looping wake -> empty -> drain -> wake.
-		if err := r.applyNodeTemplate(ctx, m); err != nil {
-			return ctrl.Result{}, err
-		}
-		// Compare declared capacity to what the now-Ready Node reports, to warn (not
-		// auto-correct) on operator drift in the spec.capacity source of truth.
-		drift, err := r.capacityDrift(ctx, m)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		m.Status.State = v1alpha1.MachineStateReady
-		m.Status.BootStartTime = nil
-		setCondition(m, v1alpha1.ConditionReady, metav1.ConditionTrue, reasonReady, "backing Node is Ready")
-		if err := r.Status().Update(ctx, m); err != nil {
-			return ctrl.Result{}, fmt.Errorf("move machine %q to Ready: %w", m.Name, err)
-		}
-		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonReady, "Node %q is Ready", m.Spec.NodeName)
-		if uncordoned {
-			r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonUncordoned,
-				"uncordoned Node %q on wake (it was cordoned by a prior scale-down)", m.Spec.NodeName)
-		}
-		if drift != "" {
-			r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonCapacityDrift,
-				"declared spec.capacity differs from Node %q: %s (fit uses spec.capacity; reconcile this by hand)",
-				m.Spec.NodeName, drift)
-		}
-		// Clear the trigger so a stale annotation does not re-wake the node later.
-		if err := r.removeWakeAnnotation(ctx, m); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+		return r.promoteToReady(ctx, m)
 	}
 
 	if r.bootTimedOut(m) {
-		m.Status.State = v1alpha1.MachineStateFailed
-		setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonBootTimeout,
+		return r.failBoot(ctx, m, reasonBootTimeout,
 			fmt.Sprintf("Node %q not Ready within %s", m.Spec.NodeName, r.BootTimeout))
-		if err := r.Status().Update(ctx, m); err != nil {
-			return ctrl.Result{}, fmt.Errorf("fail machine %q on boot timeout: %w", m.Name, err)
-		}
-		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonBootTimeout,
-			"Node %q did not become Ready within %s", m.Spec.NodeName, r.BootTimeout)
-		return ctrl.Result{}, nil
 	}
 
 	r.resendPowerOn(ctx, m)
 	return ctrl.Result{RequeueAfter: r.requeueForBoot(m)}, nil
+}
+
+// promoteToReady moves a Machine whose Node is Ready into Ready: it lifts a cordon
+// ONP placed on a prior scale-down, stamps the pool template and Machine labels
+// onto the Node, warns on capacity drift, and clears the one-shot wake trigger.
+// A template the API server rejects is a configuration error no retry can fix,
+// so it fails the Machine instead of leaving it Booting — a Booting Machine holds
+// back every other wake that would fit the same pod.
+func (r *MachineReconciler) promoteToReady(ctx context.Context, m *v1alpha1.Machine) (ctrl.Result, error) {
+	// A node ONP cordoned during a prior scale-down is being woken back into
+	// service; lift that cordon so it can host pods again. An operator's manual
+	// cordon (no onp.io/cordoned-by-onp marker) is left alone.
+	uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Stamp the pool Template + Machine labels/taints onto the real Node so it
+	// carries what the fit simulation assumed when it chose to wake this Machine
+	// (DESIGN.md 3.2). Without this a pod whose nodeSelector matches a Template
+	// label passes fit but never binds, looping wake -> empty -> drain -> wake.
+	if err := r.applyNodeTemplate(ctx, m); err != nil {
+		if apierrors.IsInvalid(err) {
+			return r.failBoot(ctx, m, reasonTemplateRejected,
+				fmt.Sprintf("Node %q rejected the template: %v", m.Spec.NodeName, err))
+		}
+		if r.bootTimedOut(m) {
+			return r.failBoot(ctx, m, reasonBootTimeout,
+				fmt.Sprintf("Node %q is Ready but the template could not be applied within %s: %v", m.Spec.NodeName, r.BootTimeout, err))
+		}
+		return ctrl.Result{}, err
+	}
+	// Compare declared capacity to what the now-Ready Node reports, to warn (not
+	// auto-correct) on operator drift in the spec.capacity source of truth.
+	drift, err := r.capacityDrift(ctx, m)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Record the wake latency once, on the transition: power-on -> Ready.
+	if m.Status.BootStartTime != nil {
+		metrics.ObserveScaleUpLatency(r.Clock.Since(m.Status.BootStartTime.Time))
+	}
+	m.Status.State = v1alpha1.MachineStateReady
+	m.Status.BootStartTime = nil
+	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionTrue, reasonReady, "backing Node is Ready")
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("move machine %q to Ready: %w", m.Name, err)
+	}
+	r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonReady, "Node %q is Ready", m.Spec.NodeName)
+	if uncordoned {
+		r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonUncordoned,
+			"uncordoned Node %q on wake (it was cordoned by a prior scale-down)", m.Spec.NodeName)
+	}
+	if drift != "" {
+		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonCapacityDrift,
+			"declared spec.capacity differs from Node %q: %s (fit uses spec.capacity; reconcile this by hand)",
+			m.Spec.NodeName, drift)
+	}
+	// Clear the trigger so a stale annotation does not re-wake the node later.
+	if err := r.removeWakeAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// failBoot moves a Machine that cannot finish booting into Failed — terminal, an
+// operator resolves it — with a Ready=False condition and a Warning Event.
+func (r *MachineReconciler) failBoot(ctx context.Context, m *v1alpha1.Machine, reason, message string) (ctrl.Result, error) {
+	m.Status.State = v1alpha1.MachineStateFailed
+	setCondition(m, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, message)
+	if err := r.Status().Update(ctx, m); err != nil {
+		return ctrl.Result{}, fmt.Errorf("fail machine %q: %w", m.Name, err)
+	}
+	r.Recorder.Event(m, corev1.EventTypeWarning, reason, message)
+	return ctrl.Result{}, nil
 }
 
 // resendPowerOn repeats the power-on while a Machine is Booting. One command can
@@ -844,10 +868,9 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 		}
 	}
 	for _, t := range desiredTaints {
-		if !hasTaint(node.Spec.Taints, t) {
-			node.Spec.Taints = append(node.Spec.Taints, t)
-			changed = true
-		}
+		var merged bool
+		node.Spec.Taints, merged = mergeTaint(node.Spec.Taints, t)
+		changed = changed || merged
 	}
 	if !changed {
 		return nil
@@ -858,15 +881,22 @@ func (r *MachineReconciler) applyNodeTemplate(ctx context.Context, m *v1alpha1.M
 	return nil
 }
 
-// hasTaint reports whether taints already contains an entry equal to t on key,
-// value and effect.
-func hasTaint(taints []corev1.Taint, t corev1.Taint) bool {
+// mergeTaint puts t into taints and reports whether that changed them. A taint
+// is identified by key and effect — the API server rejects two with the same pair
+// — so a template that changes a taint's value replaces the Node's entry rather
+// than adding a second one.
+func mergeTaint(taints []corev1.Taint, t corev1.Taint) ([]corev1.Taint, bool) {
 	for i := range taints {
-		if taints[i].Key == t.Key && taints[i].Value == t.Value && taints[i].Effect == t.Effect {
-			return true
+		if taints[i].Key != t.Key || taints[i].Effect != t.Effect {
+			continue
 		}
+		if taints[i].Value == t.Value {
+			return taints, false
+		}
+		taints[i].Value = t.Value
+		return taints, true
 	}
-	return false
+	return append(taints, t), true
 }
 
 // capacityDrift compares the Machine's declared spec.capacity to what its backing
