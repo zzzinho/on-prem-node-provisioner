@@ -355,7 +355,7 @@ func (r *MachineReconciler) promoteToReady(ctx context.Context, m *v1alpha1.Mach
 	}
 	if drift != "" {
 		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonCapacityDrift,
-			"declared spec.capacity differs from Node %q: %s (fit uses spec.capacity; reconcile this by hand)",
+			"declared spec.capacity differs from Node %q allocatable: %s (fit uses the smaller of the two; reconcile this by hand)",
 			m.Spec.NodeName, drift)
 	}
 	// Clear the trigger so a stale annotation does not re-wake the node later.
@@ -929,11 +929,12 @@ func mergeTaint(taints []corev1.Taint, t corev1.Taint) ([]corev1.Taint, bool) {
 	return append(taints, t), true
 }
 
-// capacityDrift compares the Machine's declared spec.capacity to what its backing
-// Node reports once Ready, returning a human-readable summary of every resource
-// that differs (or "" when none do). It does not correct anything — the spec is
-// the fit source of truth by design, and a mismatch may be the operator's intent —
-// it only gives the caller a string to warn with (DESIGN.md 3.2).
+// capacityDrift compares the Machine's declared spec.capacity to the allocatable
+// its backing Node reports once Ready — what the scheduler actually places pods
+// against, after kubelet reservations — returning a human-readable summary of
+// every resource that differs (or "" when none do). It does not correct anything
+// — a mismatch may be the operator's intent — it only gives the caller a string
+// to warn with (DESIGN.md 3.2).
 func (r *MachineReconciler) capacityDrift(ctx context.Context, m *v1alpha1.Machine) (string, error) {
 	if len(m.Spec.Capacity) == 0 || m.Spec.NodeName == "" {
 		return "", nil
@@ -947,7 +948,7 @@ func (r *MachineReconciler) capacityDrift(ctx context.Context, m *v1alpha1.Machi
 	}
 	var diffs []string
 	for name, declared := range m.Spec.Capacity {
-		actual, ok := node.Status.Capacity[name]
+		actual, ok := node.Status.Allocatable[name]
 		if !ok {
 			diffs = append(diffs, fmt.Sprintf("%s declared %s, Node reports none", name, declared.String()))
 			continue

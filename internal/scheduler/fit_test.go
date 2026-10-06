@@ -90,6 +90,22 @@ func TestFit(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "cordoned node does not fit",
+			pod:  pod(list("cpu", "1")),
+			node: func() *corev1.Node { n := node(ample(), nil, nil); n.Spec.Unschedulable = true; return n }(),
+			want: false,
+		},
+		{
+			name: "pod tolerating the unschedulable taint fits a cordoned node",
+			pod: func() *corev1.Pod {
+				p := pod(list("cpu", "1"))
+				p.Spec.Tolerations = []corev1.Toleration{{Key: corev1.TaintNodeUnschedulable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+				return p
+			}(),
+			node: func() *corev1.Node { n := node(ample(), nil, nil); n.Spec.Unschedulable = true; return n }(),
+			want: true,
+		},
+		{
 			name: "cpu request exceeds allocatable",
 			pod:  pod(list("cpu", "2")),
 			node: node(list("cpu", "1"), nil, nil),
@@ -243,5 +259,40 @@ func TestFit(t *testing.T) {
 				t.Errorf("Fit() failed but Reason is empty; want a non-empty explanation")
 			}
 		})
+	}
+}
+
+// TestFitAppliesExtraPredicates: a caller-supplied predicate runs after the
+// defaults and its reason is reported; a node that passes it still fits.
+func TestFitAppliesExtraPredicates(t *testing.T) {
+	n := node(list("cpu", "4"), nil, nil)
+	p := pod(list("cpu", "1"))
+	reject := func(*corev1.Pod, *corev1.Node) string { return "rejected by caller" }
+	accept := func(*corev1.Pod, *corev1.Node) string { return "" }
+
+	if got := scheduler.Fit(p, n, reject); got.Fits || got.Reason != "rejected by caller" {
+		t.Errorf("Fit(reject) = %+v, want Fits=false Reason=%q", got, "rejected by caller")
+	}
+	if got := scheduler.Fit(p, n, accept); !got.Fits {
+		t.Errorf("Fit(accept) = %+v, want Fits=true", got)
+	}
+}
+
+func TestVolumeNodeAffinity(t *testing.T) {
+	onlyOn := func(host string) *corev1.NodeSelector {
+		return &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+			MatchExpressions: []corev1.NodeSelectorRequirement{{
+				Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{host},
+			}},
+		}}}
+	}
+	n := node(list("cpu", "4"), map[string]string{corev1.LabelHostname: "node-a"}, nil)
+	p := pod(list("cpu", "1"))
+
+	if got := scheduler.Fit(p, n, scheduler.VolumeNodeAffinity([]*corev1.NodeSelector{onlyOn("node-a")})); !got.Fits {
+		t.Errorf("volume on this node: Fit = %+v, want fits", got)
+	}
+	if got := scheduler.Fit(p, n, scheduler.VolumeNodeAffinity([]*corev1.NodeSelector{onlyOn("node-b")})); got.Fits {
+		t.Error("volume on another node: Fit = fits, want volume node affinity conflict")
 	}
 }

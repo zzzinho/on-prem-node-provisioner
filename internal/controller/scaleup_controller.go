@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -69,6 +73,11 @@ type ScaleUpReconciler struct {
 	// it with a fake clock. A PassiveClock is enough — cooldown is evaluated each
 	// reconcile, not scheduled.
 	Clock clock.PassiveClock
+	// APIReader reads straight from the API server. A pending pod's claims and
+	// their volumes are read through it with get alone, so the controller needs no
+	// cluster-wide list/watch on PersistentVolumes or claims. main.go wires
+	// mgr.GetAPIReader().
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -76,6 +85,7 @@ type ScaleUpReconciler struct {
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;persistentvolumes,verbs=get
 
 // Reconcile picks a powered-off Machine to wake for one unschedulable Pod. It is
 // driven by the Pod, re-verifies candidacy (the watch predicate pre-filters, but
@@ -107,6 +117,11 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	volumeAffinities, err := podVolumeAffinities(ctx, r.APIReader, &pod)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	onVolumeNode := scheduler.VolumeNodeAffinity(volumeAffinities)
 
 	// Walk every pool's members, fit-checking each against a synthetic Node that
 	// describes how the Machine will look once Ready. We track, across all pools:
@@ -150,8 +165,16 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		for j := range machines.Items {
 			m := &machines.Items[j]
-			node := nodeForMachine(m, pool)
-			if !scheduler.Fit(&pod, node).Fits {
+			real, err := backingNode(ctx, r.Client, m.Spec.NodeName)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			bound, err := boundRequests(ctx, r.Client, m.Spec.NodeName)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			node := nodeForMachine(m, pool, real, bound)
+			if !scheduler.Fit(&pod, node, onVolumeNode).Fits {
 				continue
 			}
 			if isWaking(m) || r.settling(m) {
@@ -280,24 +303,36 @@ func (r *ScaleUpReconciler) requestWake(ctx context.Context, m *v1alpha1.Machine
 	return nil
 }
 
-// nodeForMachine builds the synthetic Node a Machine will present once Ready: its
-// declared Capacity becomes allocatable, its Node labels are the pool Template
-// labels overlaid by the Machine's own Labels (Machine wins on conflict — the
-// per-node label is the more specific intent), and the pool Template taints are
-// applied. scheduler.Fit reads only Allocatable, Labels and Taints, so that is
-// all this assembles.
-func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool) *corev1.Node {
-	labels := make(map[string]string, len(pool.Spec.Template.Labels)+len(m.Spec.Labels))
+// nodeForMachine builds the synthetic Node a Machine will present once Ready.
+// It starts from the real Node object when one exists — a powered-off node keeps
+// its Node object — because the labels the kubelet and node-feature discovery
+// put there (kubernetes.io/os, arch, GPU product labels) are back the moment it
+// boots, and an operator's cordon or taint survives the boot too. Over that come
+// the pool Template labels, then the Machine's own Labels (Machine wins on
+// conflict), and the Template taints. Lifecycle taints (node.kubernetes.io/*)
+// only describe the node being down and are dropped, as is a cordon ONP placed
+// itself, which the wake lifts. Allocatable is the room left once it is up (see
+// syntheticAllocatable); bound holds the requests of pods still bound to it.
+func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool, real *corev1.Node, bound corev1.ResourceList) *corev1.Node {
+	labels := map[string]string{corev1.LabelHostname: m.Spec.NodeName}
+	var taints []corev1.Taint
+	var cordoned bool
+	if real != nil {
+		for k, v := range real.Labels {
+			labels[k] = v
+		}
+		taints = persistentTaints(real.Spec.Taints)
+		_, onpCordon := real.Annotations[v1alpha1.AnnotationCordonedByONP]
+		cordoned = real.Spec.Unschedulable && !onpCordon
+	}
 	for k, v := range pool.Spec.Template.Labels {
 		labels[k] = v
 	}
 	for k, v := range m.Spec.Labels {
 		labels[k] = v
 	}
-
-	var taints []corev1.Taint
-	if len(pool.Spec.Template.Taints) > 0 {
-		taints = append(taints, pool.Spec.Template.Taints...)
+	for _, t := range pool.Spec.Template.Taints {
+		taints, _ = mergeTaint(taints, t)
 	}
 
 	return &corev1.Node{
@@ -305,11 +340,107 @@ func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool) *corev1.Node {
 			Name:   m.Spec.NodeName,
 			Labels: labels,
 		},
-		Spec: corev1.NodeSpec{Taints: taints},
+		Spec: corev1.NodeSpec{Taints: taints, Unschedulable: cordoned},
 		Status: corev1.NodeStatus{
-			Allocatable: m.Spec.Capacity,
+			Allocatable: syntheticAllocatable(m.Spec.Capacity, real, bound),
 		},
 	}
+}
+
+// syntheticAllocatable is the room a Machine's node will offer once Ready. Per
+// native resource (cpu, memory, ...) it takes the declared capacity capped by the
+// allocatable the Node last reported — kubelet reservations come off the top. A
+// declared extended resource (nvidia.com/gpu) is not capped: a device plugin that
+// had not registered yet, or had just stopped, reports it as 0, and that 0 would
+// keep the node from ever being woken for the pods it exists for. A resource the
+// Machine does not declare comes from the Node.
+// The requests of pods still bound to the node (DaemonSet pods stay bound while
+// it is off, and the scheduler counts them) are subtracted, floored at zero.
+func syntheticAllocatable(capacity corev1.ResourceList, real *corev1.Node, bound corev1.ResourceList) corev1.ResourceList {
+	out := capacity.DeepCopy()
+	if out == nil {
+		out = corev1.ResourceList{}
+	}
+	if real != nil {
+		for name, reported := range real.Status.Allocatable {
+			declared, ok := out[name]
+			if !ok || (!isExtendedResource(name) && reported.Cmp(declared) < 0) {
+				out[name] = reported.DeepCopy()
+			}
+		}
+	}
+	for name, used := range bound {
+		avail, ok := out[name]
+		if !ok {
+			continue
+		}
+		avail.Sub(used)
+		if avail.Sign() < 0 {
+			avail = resource.Quantity{}
+		}
+		out[name] = avail
+	}
+	return out
+}
+
+// isExtendedResource reports whether name is a domain-qualified resource such as
+// a device plugin's nvidia.com/gpu, as opposed to a native one (cpu, memory,
+// ephemeral-storage, hugepages-*).
+func isExtendedResource(name corev1.ResourceName) bool {
+	return strings.Contains(string(name), "/")
+}
+
+// boundRequests sums the requests of pods bound to nodeName that will still hold
+// their place once it boots: everything but finished pods and pods already being
+// deleted, which the kubelet clears as it comes up.
+func boundRequests(ctx context.Context, c client.Client, nodeName string) (corev1.ResourceList, error) {
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
+		return nil, fmt.Errorf("list pods on node %q: %w", nodeName, err)
+	}
+	total := corev1.ResourceList{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for name, q := range resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{}) {
+			sum := total[name]
+			sum.Add(q)
+			total[name] = sum
+		}
+	}
+	return total, nil
+}
+
+// backingNode returns the named Node, or nil when it does not exist (a Machine
+// whose node never joined).
+func backingNode(ctx context.Context, c client.Client, nodeName string) (*corev1.Node, error) {
+	if nodeName == "" {
+		return nil, nil
+	}
+	var node corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get node %q: %w", nodeName, err)
+	}
+	return &node, nil
+}
+
+// persistentTaints returns the taints that will still be on the node once it
+// boots: everything but the node.kubernetes.io/* lifecycle taints the node
+// controller sets while a node is NotReady, unreachable or cordoned.
+func persistentTaints(taints []corev1.Taint) []corev1.Taint {
+	var kept []corev1.Taint
+	for _, t := range taints {
+		if strings.HasPrefix(t.Key, "node.kubernetes.io/") {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept
 }
 
 // smallestCandidate returns the candidate whose Machine is smallest by capacity,
@@ -327,6 +458,47 @@ func smallestCandidate(candidates []wakeCandidate) wakeCandidate {
 		return a.Name < b.Name
 	})
 	return candidates[0]
+}
+
+// podVolumeAffinities returns the required node affinity of every
+// PersistentVolume bound to a claim the pod mounts (persistentVolumeClaim and
+// generic ephemeral volumes). An unbound or missing claim adds nothing: a
+// WaitForFirstConsumer volume is provisioned where the pod lands, and a pod
+// waiting on a claim that does not exist yet is not waiting on a node.
+func podVolumeAffinities(ctx context.Context, reader client.Reader, pod *corev1.Pod) ([]*corev1.NodeSelector, error) {
+	var required []*corev1.NodeSelector
+	for _, vol := range pod.Spec.Volumes {
+		var claim string
+		switch {
+		case vol.PersistentVolumeClaim != nil:
+			claim = vol.PersistentVolumeClaim.ClaimName
+		case vol.Ephemeral != nil:
+			claim = pod.Name + "-" + vol.Name
+		default:
+			continue
+		}
+		var pvc corev1.PersistentVolumeClaim
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: claim}, &pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("get claim %s/%s: %w", pod.Namespace, claim, err)
+		}
+		if pvc.Spec.VolumeName == "" {
+			continue
+		}
+		var pv corev1.PersistentVolume
+		if err := reader.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, &pv); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("get volume %s: %w", pvc.Spec.VolumeName, err)
+		}
+		if pv.Spec.NodeAffinity != nil && pv.Spec.NodeAffinity.Required != nil {
+			required = append(required, pv.Spec.NodeAffinity.Required)
+		}
+	}
+	return required, nil
 }
 
 // poolMemberships counts, per Machine name, how many of pools select it.

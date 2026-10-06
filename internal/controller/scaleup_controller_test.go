@@ -55,6 +55,30 @@ func readyMachineSince(name string, lbls map[string]string, since time.Time) *v1
 	return m
 }
 
+// boundPod builds a Running pod bound to node requesting cpu, as a DaemonSet pod
+// stays bound to a node while it is off.
+func boundPod(name, node, cpu string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: node,
+			Containers: []corev1.Container{{
+				Name:      "c",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+// offNode builds the Node object a powered-off Machine leaves behind, adjusted by
+// edit.
+func offNode(name string, edit func(*corev1.Node)) *corev1.Node {
+	n := notReadyNode(name)
+	edit(n)
+	return n
+}
+
 // pendingPod builds an unbound Pending Pod requesting cpu/mem. When unsched is
 // true it carries the PodScheduled=False/Unschedulable condition that marks it a
 // scale-up candidate.
@@ -90,10 +114,18 @@ func newScaleUpReconciler(t *testing.T, rec record.EventRecorder, objs ...client
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.NodePool{}).
+		// Mirror main.go's pod index so pods still bound to a node resolve.
+		WithIndex(&corev1.Pod{}, IndexPodNodeName, func(o client.Object) []string {
+			pod, ok := o.(*corev1.Pod)
+			if !ok || pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).
 		WithObjects(objs...).
 		Build()
 	clk := clocktesting.NewFakePassiveClock(scaleUpBase)
-	return &ScaleUpReconciler{Client: cl, Scheme: scheme, Recorder: rec, Clock: clk}, cl
+	return &ScaleUpReconciler{Client: cl, Scheme: scheme, Recorder: rec, Clock: clk, APIReader: cl}, cl
 }
 
 // wokenMachines returns the names of Machines carrying the wake-now trigger.
@@ -214,6 +246,175 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 				},
 			},
 			wantWoken: []string{"single"},
+			wantEvent: true,
+		},
+		{
+			name: "pod selecting kubernetes.io/os wakes a machine whose node carries it",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+				return p
+			}(),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) { n.Labels = map[string]string{"kubernetes.io/os": "linux"} }),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "pod selecting its node by hostname wakes it even with no Node labels known",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": "g1"}
+				return p
+			}(),
+			machines:  []client.Object{scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff)},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "machine whose node an operator cordoned is not woken",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) { n.Spec.Unschedulable = true }),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "machine whose node ONP cordoned is woken (the wake lifts it)",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) {
+					n.Spec.Unschedulable = true
+					n.Annotations = map[string]string{v1alpha1.AnnotationCordonedByONP: "true"}
+				}),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "operator NoSchedule taint on the node blocks the wake; lifecycle taints do not",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("tainted", gpu, "2", "4Gi", v1alpha1.MachineStateOff),
+				offNode("tainted", func(n *corev1.Node) {
+					n.Spec.Taints = []corev1.Taint{{Key: "maintenance", Effect: corev1.TaintEffectNoSchedule}}
+				}),
+				scaleMachine("down", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("down", func(n *corev1.Node) {
+					n.Spec.Taints = []corev1.Taint{{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}}
+				}),
+			},
+			wantWoken: []string{"down"},
+			wantEvent: true,
+		},
+		{
+			name: "pods still bound to the off node take their share of its capacity",
+			pod:  pendingPod("3500m", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				boundPod("ds-1", "g1", "1"),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "a pod being deleted on the off node does not take capacity",
+			pod:  pendingPod("3500m", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				func() client.Object {
+					p := boundPod("leaving", "g1", "4")
+					now := metav1.NewTime(scaleUpBase)
+					p.DeletionTimestamp = &now
+					p.Finalizers = []string{"keep"}
+					return p
+				}(),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "node's last reported allocatable caps the declared capacity",
+			pod:  pendingPod("3500m", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) {
+					n.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}
+				}),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "a declared GPU is not capped by a node that last reported none",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.Containers[0].Resources.Requests["nvidia.com/gpu"] = resource.MustParse("1")
+				return p
+			}(),
+			machines: []client.Object{
+				func() client.Object {
+					m := scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff)
+					m.Spec.Capacity["nvidia.com/gpu"] = resource.MustParse("1")
+					return m
+				}(),
+				offNode("g1", func(n *corev1.Node) {
+					n.Status.Allocatable = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("0")}
+				}),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "a resource the Machine does not declare comes from the node",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+				return p
+			}(),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) {
+					n.Status.Allocatable = corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("100Gi")}
+				}),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "pod whose volume lives on one node wakes that node, not a smaller one",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.Volumes = []corev1.Volume{{
+					Name:         "data",
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}},
+				}}
+				return p
+			}(),
+			machines: []client.Object{
+				scaleMachine("small", gpu, "2", "4Gi", v1alpha1.MachineStateOff),
+				scaleMachine("holder", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+					Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-local"},
+				},
+				&corev1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{Name: "pv-local"},
+					Spec: corev1.PersistentVolumeSpec{NodeAffinity: &corev1.VolumeNodeAffinity{
+						Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{"holder"},
+							}},
+						}}},
+					}},
+				},
+			},
+			wantWoken: []string{"holder"},
 			wantEvent: true,
 		},
 		{
