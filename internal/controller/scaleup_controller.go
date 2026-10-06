@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -140,7 +141,9 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				wakeInFlight = true
 				continue
 			}
-			if m.Status.State != v1alpha1.MachineStateOff {
+			// Only an Off Machine not yet asked to wake is a candidate; one whose
+			// power-on keeps failing already carries the request.
+			if m.Status.State != v1alpha1.MachineStateOff || wakeRequested(m) {
 				continue
 			}
 			// A fitting Off member, but the pool's guards may forbid waking it.
@@ -372,7 +375,13 @@ func isWaking(m *v1alpha1.Machine) bool {
 	if m.Status.State == v1alpha1.MachineStateBooting {
 		return true
 	}
-	return m.Status.State == v1alpha1.MachineStateOff && wakeRequested(m)
+	if m.Status.State != v1alpha1.MachineStateOff || !wakeRequested(m) {
+		return false
+	}
+	// A wake whose last power-on failed is not in flight: the controller keeps
+	// retrying it, but the pod may be served by another Machine meanwhile.
+	c := meta.FindStatusCondition(m.Status.Conditions, v1alpha1.ConditionPowerOnSucceeded)
+	return c == nil || c.Status != metav1.ConditionFalse
 }
 
 // isScaleUpCandidate reports whether a Pod needs a node woken for it: it is

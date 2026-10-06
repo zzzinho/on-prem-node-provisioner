@@ -374,6 +374,11 @@ func (r *MachineReconciler) failBoot(ctx context.Context, m *v1alpha1.Machine, r
 		return ctrl.Result{}, fmt.Errorf("fail machine %q: %w", m.Name, err)
 	}
 	r.Recorder.Event(m, corev1.EventTypeWarning, reason, message)
+	// The wake request is spent: left in place it would power the node on again
+	// the moment an operator returns the Machine to Off.
+	if err := r.removeWakeAnnotation(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
 }
 

@@ -153,6 +153,24 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 			wantEvent: false,
 		},
 		{
+			name: "off machine whose power-on failed does not block another fit machine",
+			pod:  pendingPod("1", "1Gi", true),
+			machines: []client.Object{
+				func() client.Object {
+					m := scaleMachine("failing", gpu, "4", "8Gi", v1alpha1.MachineStateOff)
+					m.Annotations = map[string]string{v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue}
+					m.Status.Conditions = []metav1.Condition{{
+						Type: v1alpha1.ConditionPowerOnSucceeded, Status: metav1.ConditionFalse,
+						Reason: "PowerOnFailed", LastTransitionTime: metav1.NewTime(scaleUpBase),
+					}}
+					return m
+				}(),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: []string{"failing", "idle"}, // failing keeps its retry; idle serves the pod
+			wantEvent: true,
+		},
+		{
 			name: "machine outside any pool selector is not considered",
 			pod:  pendingPod("1", "1Gi", true),
 			machines: []client.Object{

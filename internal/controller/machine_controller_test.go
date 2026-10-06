@@ -441,6 +441,34 @@ func TestReconcileOffAdoptsReadyNode(t *testing.T) {
 	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonAdopted)
 }
 
+// TestReconcileBootTimeoutClearsWakeNow: a boot that times out spends its wake
+// request, so an operator returning the Failed Machine to Off does not power the
+// node straight back on.
+func TestReconcileBootTimeoutClearsWakeNow(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateBooting, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	f := newFixture(t, m, notReadyNode("node-a"))
+	start := metav1.NewTime(f.clock.Now())
+	m.Status.BootStartTime = &start
+	if err := f.cl.Status().Update(context.Background(), m); err != nil {
+		t.Fatalf("seed BootStartTime: %v", err)
+	}
+	f.clock.Step(11 * time.Minute)
+
+	f.reconcile(t)
+
+	got := f.getMachine(t)
+	if got.Status.State != v1alpha1.MachineStateFailed {
+		t.Fatalf("state = %q, want %q", got.Status.State, v1alpha1.MachineStateFailed)
+	}
+	if _, ok := got.Annotations[v1alpha1.AnnotationWakeNow]; ok {
+		t.Error("wake-now kept on a Failed Machine, want removed")
+	}
+}
+
 func TestReconcileOffPowerOnErrorStaysOff(t *testing.T) {
 	t.Parallel()
 
