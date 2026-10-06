@@ -125,7 +125,7 @@ func newScaleUpReconciler(t *testing.T, rec record.EventRecorder, objs ...client
 		WithObjects(objs...).
 		Build()
 	clk := clocktesting.NewFakePassiveClock(scaleUpBase)
-	return &ScaleUpReconciler{Client: cl, Scheme: scheme, Recorder: rec, Clock: clk}, cl
+	return &ScaleUpReconciler{Client: cl, Scheme: scheme, Recorder: rec, Clock: clk, APIReader: cl}, cl
 }
 
 // wokenMachines returns the names of Machines carrying the wake-now trigger.
@@ -384,6 +384,37 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 				}),
 			},
 			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "pod whose volume lives on one node wakes that node, not a smaller one",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.Volumes = []corev1.Volume{{
+					Name:         "data",
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}},
+				}}
+				return p
+			}(),
+			machines: []client.Object{
+				scaleMachine("small", gpu, "2", "4Gi", v1alpha1.MachineStateOff),
+				scaleMachine("holder", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+					Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-local"},
+				},
+				&corev1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{Name: "pv-local"},
+					Spec: corev1.PersistentVolumeSpec{NodeAffinity: &corev1.VolumeNodeAffinity{
+						Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{"holder"},
+							}},
+						}}},
+					}},
+				},
+			},
+			wantWoken: []string{"holder"},
 			wantEvent: true,
 		},
 		{

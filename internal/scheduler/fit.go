@@ -132,3 +132,20 @@ func fitsResources(requests, allocatable corev1.ResourceList) string {
 	}
 	return ""
 }
+
+// VolumeNodeAffinity returns a Predicate that fails unless the node satisfies
+// every given PersistentVolume node affinity — the spec.nodeAffinity.required of
+// the volumes bound to the pod's claims, which kube-scheduler's VolumeBinding
+// plugin enforces. A pod pinned to a local volume on one node must not wake
+// another. The caller resolves the pod's volumes; the predicate only matches.
+func VolumeNodeAffinity(required []*corev1.NodeSelector) Predicate {
+	return func(_ *corev1.Pod, node *corev1.Node) string {
+		for _, ns := range required {
+			selector, err := nodeaffinity.NewNodeSelector(ns)
+			if err != nil || !selector.Match(node) {
+				return "volume node affinity conflict"
+			}
+		}
+		return ""
+	}
+}

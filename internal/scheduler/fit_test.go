@@ -277,3 +277,22 @@ func TestFitAppliesExtraPredicates(t *testing.T) {
 		t.Errorf("Fit(accept) = %+v, want Fits=true", got)
 	}
 }
+
+func TestVolumeNodeAffinity(t *testing.T) {
+	onlyOn := func(host string) *corev1.NodeSelector {
+		return &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+			MatchExpressions: []corev1.NodeSelectorRequirement{{
+				Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{host},
+			}},
+		}}}
+	}
+	n := node(list("cpu", "4"), map[string]string{corev1.LabelHostname: "node-a"}, nil)
+	p := pod(list("cpu", "1"))
+
+	if got := scheduler.Fit(p, n, scheduler.VolumeNodeAffinity([]*corev1.NodeSelector{onlyOn("node-a")})); !got.Fits {
+		t.Errorf("volume on this node: Fit = %+v, want fits", got)
+	}
+	if got := scheduler.Fit(p, n, scheduler.VolumeNodeAffinity([]*corev1.NodeSelector{onlyOn("node-b")})); got.Fits {
+		t.Error("volume on another node: Fit = fits, want volume node affinity conflict")
+	}
+}

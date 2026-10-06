@@ -73,6 +73,11 @@ type ScaleUpReconciler struct {
 	// it with a fake clock. A PassiveClock is enough — cooldown is evaluated each
 	// reconcile, not scheduled.
 	Clock clock.PassiveClock
+	// APIReader reads straight from the API server. A pending pod's claims and
+	// their volumes are read through it with get alone, so the controller needs no
+	// cluster-wide list/watch on PersistentVolumes or claims. main.go wires
+	// mgr.GetAPIReader().
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -80,6 +85,7 @@ type ScaleUpReconciler struct {
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;persistentvolumes,verbs=get
 
 // Reconcile picks a powered-off Machine to wake for one unschedulable Pod. It is
 // driven by the Pod, re-verifies candidacy (the watch predicate pre-filters, but
@@ -111,6 +117,11 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	volumeAffinities, err := podVolumeAffinities(ctx, r.APIReader, &pod)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	onVolumeNode := scheduler.VolumeNodeAffinity(volumeAffinities)
 
 	// Walk every pool's members, fit-checking each against a synthetic Node that
 	// describes how the Machine will look once Ready. We track, across all pools:
@@ -163,7 +174,7 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{}, err
 			}
 			node := nodeForMachine(m, pool, real, bound)
-			if !scheduler.Fit(&pod, node).Fits {
+			if !scheduler.Fit(&pod, node, onVolumeNode).Fits {
 				continue
 			}
 			if isWaking(m) || r.settling(m) {
@@ -447,6 +458,47 @@ func smallestCandidate(candidates []wakeCandidate) wakeCandidate {
 		return a.Name < b.Name
 	})
 	return candidates[0]
+}
+
+// podVolumeAffinities returns the required node affinity of every
+// PersistentVolume bound to a claim the pod mounts (persistentVolumeClaim and
+// generic ephemeral volumes). An unbound or missing claim adds nothing: a
+// WaitForFirstConsumer volume is provisioned where the pod lands, and a pod
+// waiting on a claim that does not exist yet is not waiting on a node.
+func podVolumeAffinities(ctx context.Context, reader client.Reader, pod *corev1.Pod) ([]*corev1.NodeSelector, error) {
+	var required []*corev1.NodeSelector
+	for _, vol := range pod.Spec.Volumes {
+		var claim string
+		switch {
+		case vol.PersistentVolumeClaim != nil:
+			claim = vol.PersistentVolumeClaim.ClaimName
+		case vol.Ephemeral != nil:
+			claim = pod.Name + "-" + vol.Name
+		default:
+			continue
+		}
+		var pvc corev1.PersistentVolumeClaim
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: claim}, &pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("get claim %s/%s: %w", pod.Namespace, claim, err)
+		}
+		if pvc.Spec.VolumeName == "" {
+			continue
+		}
+		var pv corev1.PersistentVolume
+		if err := reader.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, &pv); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("get volume %s: %w", pvc.Spec.VolumeName, err)
+		}
+		if pv.Spec.NodeAffinity != nil && pv.Spec.NodeAffinity.Required != nil {
+			required = append(required, pv.Spec.NodeAffinity.Required)
+		}
+	}
+	return required, nil
 }
 
 // poolMemberships counts, per Machine name, how many of pools select it.
