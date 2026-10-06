@@ -14,7 +14,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -30,6 +30,10 @@ import (
 // reasonPoweringOff is the Event reason emitted when the agent issues a host
 // power-off. Kept as a constant so the string operators grep for stays stable.
 const reasonPoweringOff = "PoweringOff"
+
+// reasonPowerOffSkipped is the Event reason emitted when the agent declines a
+// power-off because the host booted after it was requested.
+const reasonPowerOffSkipped = "PowerOffSkipped"
 
 // ShutdownReconciler powers its own node off when the backing Machine reaches
 // ShuttingDown. It only ever acts on the Machine whose spec.nodeName equals
@@ -48,19 +52,27 @@ type ShutdownReconciler struct {
 	// Recorder publishes Events on the Machine. Optional: nil disables Events.
 	Recorder record.EventRecorder
 
-	// poweredOff guards against issuing the power-off more than once. Once the
-	// command is accepted the node is going down and this pod dies with it, so a
-	// second issue would be at best redundant; a transient watch re-delivery
-	// before the kernel actually halts must not re-run it.
-	poweredOff sync.Once
+	// BootTime reports when the host last booted; production wires HostBootTime.
+	// nil skips the reboot check.
+	BootTime func() (time.Time, error)
+
+	// issued and issuedFor record the ShuttingDown episode — keyed by the
+	// Machine's status.shutdownStartTime — this process already powered off for.
+	// One episode, one power-off: a watch re-delivery of the same episode before
+	// the kernel halts must not re-run it, and a later episode (the node came back
+	// and was drained again) must not be skipped. MaxConcurrentReconciles is 1, so
+	// the fields need no lock.
+	issued    bool
+	issuedFor time.Time
 }
 
 // +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-// Reconcile powers the node off when its Machine is ShuttingDown. It is a pure
-// function of the Machine's state, so a re-delivery after a restart lands in the
-// same place — and the sync.Once keeps a re-delivery from re-issuing the halt.
+// Reconcile powers the node off once per ShuttingDown episode of its Machine. A
+// re-delivery of the same episode is a no-op; after an agent restart the episode
+// record is gone, so the host's boot time is what keeps a node that already came
+// back up from being powered off again.
 func (r *ShutdownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -91,33 +103,60 @@ func (r *ShutdownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	var issued bool
-	var powerErr error
-	r.poweredOff.Do(func() {
-		issued = true
-		logger.Info("machine is ShuttingDown, powering node off", "node", r.NodeName)
-		powerErr = r.PowerOff(ctx)
-	})
-	if !issued {
-		// Already issued on an earlier reconcile; the node is on its way down.
+	episode := shutdownEpisode(&m)
+	if r.issued && r.issuedFor.Equal(episode) {
 		return ctrl.Result{}, nil
 	}
-	if powerErr != nil {
-		// A failed power-off must surface so controller-runtime requeues; the
-		// sync.Once has already fired, so the retry runs through the !issued
-		// branch above and will NOT re-shell. We re-arm the Once so a genuine
-		// transient failure can be retried.
-		r.poweredOff = sync.Once{}
-		return ctrl.Result{}, fmt.Errorf("power off node %q: %w", r.NodeName, powerErr)
+	if r.bootedAfter(ctx, episode) {
+		// The host is up again after this power-off was requested: a board that
+		// powered itself back on, or an operator who turned it on before the
+		// controller saw it go down. Powering it off again would loop; leave it and
+		// let the controller's shutdown timeout hand it to an operator.
+		r.issued, r.issuedFor = true, episode
+		if r.Recorder != nil {
+			r.Recorder.Eventf(&m, corev1.EventTypeWarning, reasonPowerOffSkipped,
+				"node %q booted after the power-off requested at %s; not powering it off again",
+				r.NodeName, episode.Format(time.RFC3339))
+		}
+		return ctrl.Result{}, nil
 	}
+
+	logger.Info("machine is ShuttingDown, powering node off", "node", r.NodeName)
+	if err := r.PowerOff(ctx); err != nil {
+		// Not recorded as issued, so the requeue retries the power-off.
+		return ctrl.Result{}, fmt.Errorf("power off node %q: %w", r.NodeName, err)
+	}
+	r.issued, r.issuedFor = true, episode
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(&m, corev1.EventTypeNormal, reasonPoweringOff,
 			"issued graceful power-off on node %q", r.NodeName)
 	}
-	// No requeue: the node is going away. The controller observes the Node going
-	// NotReady and finalizes Machine.status.state = Off.
 	return ctrl.Result{}, nil
+}
+
+// shutdownEpisode identifies a ShuttingDown episode by the instant the controller
+// entered it; zero when the controller did not record one.
+func shutdownEpisode(m *v1alpha1.Machine) time.Time {
+	if m.Status.ShutdownStartTime == nil {
+		return time.Time{}
+	}
+	return m.Status.ShutdownStartTime.Time
+}
+
+// bootedAfter reports whether the host booted after the power-off for episode was
+// requested. An unknown episode or boot time answers false, so the agent falls
+// back to powering off as asked rather than refusing a legitimate shutdown.
+func (r *ShutdownReconciler) bootedAfter(ctx context.Context, episode time.Time) bool {
+	if r.BootTime == nil || episode.IsZero() {
+		return false
+	}
+	booted, err := r.BootTime()
+	if err != nil {
+		log.FromContext(ctx).Error(err, "read host boot time; skipping the reboot check")
+		return false
+	}
+	return booted.After(episode)
 }
 
 // SetupWithManager wires the reconciler to watch only the Machine backing this
