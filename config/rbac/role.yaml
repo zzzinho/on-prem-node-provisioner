@@ -19,7 +19,6 @@ rules:
   - get
   - list
   - patch
-  - update
   - watch
 - apiGroups:
   - ""
@@ -46,12 +45,10 @@ rules:
   - onp.io
   resources:
   - machines
-  - nodepools
   verbs:
   - get
   - list
   - patch
-  - update
   - watch
 - apiGroups:
   - onp.io
@@ -62,3 +59,11 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - onp.io
+  resources:
+  - nodepools
+  verbs:
+  - get
+  - list
+  - watch

@@ -73,7 +73,7 @@ type ScaleDownReconciler struct {
 	APIReader client.Reader
 }
 
-// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch

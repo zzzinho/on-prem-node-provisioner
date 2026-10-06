@@ -30,7 +30,7 @@ type NodePoolReconciler struct {
 	Recorder record.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools/status,verbs=get;update;patch
 
 // Reconcile recomputes a NodePool's membership counts from the Machines that

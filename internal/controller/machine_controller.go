@@ -140,10 +140,10 @@ type MachineReconciler struct {
 	APIReader client.Reader
 }
 
-// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=onp.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=onp.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=onp.io,resources=nodepools,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
