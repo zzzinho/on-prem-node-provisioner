@@ -138,6 +138,14 @@ func newFixture(t *testing.T, objs ...client.Object) *reconcilerFixture {
 			}
 			return []string{pod.Spec.NodeName}
 		}).
+		// Mirror main.go's Machine index so the duplicate-Node guard resolves.
+		WithIndex(&v1alpha1.Machine{}, IndexMachineNodeName, func(o client.Object) []string {
+			m, ok := o.(*v1alpha1.Machine)
+			if !ok || m.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{m.Spec.NodeName}
+		}).
 		WithObjects(objs...).
 		Build()
 
@@ -211,6 +219,29 @@ func TestReconcileOffWithWakeAnnotationPowersOn(t *testing.T) {
 	if m.Status.BootStartTime == nil {
 		t.Error("BootStartTime = nil, want set")
 	}
+}
+
+// TestReconcileHoldsMachineSharingNode: when two Machines claim one Node, neither
+// acts — a wake-now on one is not powered on — and a DuplicateNode Event says why.
+func TestReconcileHoldsMachineSharingNode(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateOff, map[string]string{
+		v1alpha1.AnnotationWakeNow: v1alpha1.AnnotationWakeNowValue,
+	})
+	dup := machine(v1alpha1.MachineStateOff, nil)
+	dup.Name = "node-a-copy"
+	f := newFixture(t, m, dup, notReadyNode("node-a"))
+
+	res := f.reconcile(t)
+
+	if f.provider.powerOnCalls != 0 {
+		t.Errorf("PowerOn calls = %d, want 0 while another Machine claims the Node", f.provider.powerOnCalls)
+	}
+	if res.RequeueAfter != duplicateNodeRecheck {
+		t.Errorf("RequeueAfter = %s, want %s so removing the duplicate releases the hold", res.RequeueAfter, duplicateNodeRecheck)
+	}
+	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonDuplicateNode)
 }
 
 func TestReconcileBootingNodeReadyBecomesReady(t *testing.T) {

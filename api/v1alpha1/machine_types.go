@@ -10,8 +10,12 @@ import (
 type MachineSpec struct {
 	// NodeName is the name of the Node this Machine maps to. In Phase 1 it is
 	// always equal to metadata.name; the field is explicit so the mapping can
-	// be relaxed later without a schema change.
+	// be relaxed later without a schema change. It is immutable: every state the
+	// controller and the shutdown-agent act on (a drain, a power-off) is tied to
+	// this node, so retargeting a Machine mid-lifecycle would power off a node that
+	// was never drained. Point a Machine at another node by recreating it.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="nodeName is immutable"
 	NodeName string `json:"nodeName"`
 
 	// Capacity is the node's resource capacity used for fit checks while the

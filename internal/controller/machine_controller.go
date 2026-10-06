@@ -72,7 +72,13 @@ const (
 	reasonCapacityDrift   = "CapacityDrift"
 	reasonPoolConflict    = "PoolConflict"
 	reasonDrainRefused    = "DrainRefused"
+	reasonDuplicateNode   = "DuplicateNode"
 )
+
+// duplicateNodeRecheck is how often a Machine held because another Machine
+// claims its Node re-checks, so removing the duplicate releases it without
+// waiting for an unrelated event.
+const duplicateNodeRecheck = time.Minute
 
 // shutdownPollInterval bounds how often a ShuttingDown Machine is re-reconciled
 // while we wait for its Node to go NotReady, in case the Node watch misses the
@@ -146,6 +152,19 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Not found means the Machine was deleted between enqueue and now;
 		// nothing to reconcile.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// A Node claimed by more than one Machine has no single source of truth, so
+	// none of them may act on it until an operator removes the duplicate.
+	others, err := otherMachinesOnNode(ctx, r.Client, &m)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(others) > 0 {
+		r.Recorder.Eventf(&m, corev1.EventTypeWarning, reasonDuplicateNode,
+			"Node %q is also claimed by Machine(s) %s; holding all power actions until only one Machine claims it",
+			m.Spec.NodeName, strings.Join(others, ", "))
+		return ctrl.Result{RequeueAfter: duplicateNodeRecheck}, nil
 	}
 
 	switch m.Status.State {
@@ -609,22 +628,6 @@ func (r *MachineReconciler) nodeReady(ctx context.Context, nodeName string) (boo
 		}
 	}
 	return false, nil
-}
-
-// nodeAlwaysOn reports whether the named Node carries the always-on label. A
-// missing Node is not always-on: there is nothing ONP could power off.
-func nodeAlwaysOn(ctx context.Context, c client.Client, nodeName string) (bool, error) {
-	if nodeName == "" {
-		return false, nil
-	}
-	var node corev1.Node
-	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get node %q for always-on check: %w", nodeName, err)
-	}
-	return node.Labels[v1alpha1.LabelAlwaysOn] == v1alpha1.LabelAlwaysOnValue, nil
 }
 
 // bootTimedOut reports whether the Machine has been Booting longer than
