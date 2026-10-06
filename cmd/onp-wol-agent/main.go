@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,11 +44,13 @@ const (
 
 func main() {
 	var (
-		listenAddr string
-		logLevel   string
+		listenAddr   string
+		logLevel     string
+		requireToken bool
 	)
 	flag.StringVar(&listenAddr, "listen-addr", ":9119", "Address the /wake endpoint binds to.")
 	flag.StringVar(&logLevel, "log-level", "info", "Minimum log level: debug|info|warn|error.")
+	flag.BoolVar(&requireToken, "require-token", false, "Refuse to start without a bearer token instead of serving /wake unauthenticated.")
 	flag.Parse()
 
 	lvl, err := logging.ParseLevel(logLevel)
@@ -57,7 +60,13 @@ func main() {
 	}
 	logger := logging.New(logging.Options{Level: lvl})
 
-	token := os.Getenv(tokenEnv)
+	// Trimmed: a Secret created from a file usually ends in a newline, which would
+	// make every request carry an invalid header or never match.
+	token := strings.TrimSpace(os.Getenv(tokenEnv))
+	if token == "" && requireToken {
+		logger.Error("no bearer token configured and --require-token is set; refusing to serve /wake unauthenticated", "env", tokenEnv)
+		os.Exit(1)
+	}
 	if token == "" {
 		logger.Warn("no bearer token configured — /wake is unauthenticated, any caller that can reach this host port can trigger a wake",
 			"env", tokenEnv)

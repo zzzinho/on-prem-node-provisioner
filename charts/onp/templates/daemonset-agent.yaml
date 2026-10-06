@@ -47,6 +47,9 @@ spec:
         - --listen-addr={{ .Values.wolAgent.listenAddr }}
         - --log-level={{ .Values.wolAgent.logLevel }}
         {{- if .Values.wolAgent.auth.enabled }}
+        # Auth is on: an empty token is a misconfigured Secret, not a request to
+        # run open.
+        - --require-token
         env:
         - name: ONP_WOL_AGENT_TOKEN
           valueFrom:
