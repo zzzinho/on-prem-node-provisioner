@@ -384,11 +384,13 @@ func memberNamed(members []v1alpha1.Machine, name string) *v1alpha1.Machine {
 	return nil
 }
 
-// poolScaleDownCounts splits a pool's members into those kept powered on (active
-// and not already being retired) and those already scaling down. keptOn anchors
-// the minNodes floor; scalingDown anchors the maxConcurrent cap. A member already
-// on its way down is counted in scalingDown only, never keptOn, so it neither
-// props up the floor nor is double-counted.
+// poolScaleDownCounts splits a pool's members into those kept powered on and
+// those already scaling down. keptOn anchors the minNodes floor; scalingDown
+// anchors the maxConcurrent cap. Only a Ready member keeps the floor: a Booting
+// one (or an Off one asked to wake) may never come up — a lost WoL packet, a
+// boot that times out — and counting it would let the floor's last Ready node
+// drain on a promise. A member already on its way down is counted in scalingDown
+// only, so it neither props up the floor nor is double-counted.
 func poolScaleDownCounts(members []v1alpha1.Machine) (keptOn, scalingDown int32) {
 	for i := range members {
 		m := &members[i]
@@ -396,7 +398,7 @@ func poolScaleDownCounts(members []v1alpha1.Machine) (keptOn, scalingDown int32)
 			scalingDown++
 			continue
 		}
-		if isActive(m) {
+		if m.Status.State == v1alpha1.MachineStateReady {
 			keptOn++
 		}
 	}

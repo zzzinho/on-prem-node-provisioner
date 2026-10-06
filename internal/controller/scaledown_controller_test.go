@@ -387,6 +387,28 @@ func TestScaleDownRefusesBelowMinNodes(t *testing.T) {
 
 // TestScaleDownAllowedAboveMinNodes: with a second member keeping the pool above
 // its floor, the empty node drains.
+// TestScaleDownFloorIgnoresBootingMember: a Booting member does not keep the
+// minNodes floor — its boot may never finish — so the floor's last Ready node is
+// not drained on its promise.
+func TestScaleDownFloorIgnoresBootingMember(t *testing.T) {
+	after := 5 * time.Minute
+	empty := scaleDownBase
+	a := sdMachine("node-a", v1alpha1.MachineStateReady, &empty)
+	b := sdMachine("node-b", v1alpha1.MachineStateBooting, nil)
+	pool := whenEmptyPool("edge", &after)
+	pool.Spec.MinNodes = 1
+	clk := clocktesting.NewFakePassiveClock(scaleDownBase.Add(after))
+	rec := record.NewFakeRecorder(8)
+	r, cl := newScaleDownReconciler(t, rec, clk, a, b, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if drainNowSet(getSDMachine(t, cl, "node-a")) {
+		t.Fatal("last Ready node drained while the other member is only Booting")
+	}
+	assertEvent(t, rec, reasonScaleDownBlocked)
+}
+
 func TestScaleDownAllowedAboveMinNodes(t *testing.T) {
 	after := 5 * time.Minute
 	empty := scaleDownBase

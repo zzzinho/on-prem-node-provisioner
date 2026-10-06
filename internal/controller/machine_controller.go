@@ -220,7 +220,7 @@ func (r *MachineReconciler) reconcileOff(ctx context.Context, m *v1alpha1.Machin
 	// powered on by hand, or a Machine created over a running node — is adopted as
 	// it is: no power-on, straight to Ready, so a running host is never reported
 	// (and left) as off.
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	ready, err := nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
@@ -286,7 +286,7 @@ func (r *MachineReconciler) reconcileBooting(ctx context.Context, m *v1alpha1.Ma
 	if err := r.removeDrainAnnotation(ctx, m); err != nil {
 		return ctrl.Result{}, err
 	}
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	ready, err := nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
@@ -433,7 +433,7 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 	// No drain pending: a Ready Machine whose backing Node has gone NotReady was
 	// lost outside ONP (powered off by hand, crashed, partitioned). Fall back to
 	// Off after a grace window so scale-up can wake it again.
-	ready, err := r.nodeReady(ctx, m.Spec.NodeName)
+	ready, err := nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("check node %q readiness: %w", m.Spec.NodeName, err)
 	}
@@ -708,27 +708,6 @@ func (r *MachineReconciler) reconcileShuttingDown(ctx context.Context, m *v1alph
 	r.Recorder.Eventf(m, corev1.EventTypeNormal, reasonPoweredOff,
 		"Node %q is no longer Ready; Machine is Off", m.Spec.NodeName)
 	return ctrl.Result{}, nil
-}
-
-// nodeReady reports whether the named Node exists and has a Ready condition of
-// True. A missing Node is not an error: the node may not have registered yet.
-func (r *MachineReconciler) nodeReady(ctx context.Context, nodeName string) (bool, error) {
-	if nodeName == "" {
-		return false, nil
-	}
-	var node corev1.Node
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	for _, c := range node.Status.Conditions {
-		if c.Type == corev1.NodeReady {
-			return c.Status == corev1.ConditionTrue, nil
-		}
-	}
-	return false, nil
 }
 
 // bootTimedOut reports whether the Machine has been Booting longer than

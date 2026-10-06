@@ -311,6 +311,27 @@ func TestScaleUpGuards(t *testing.T) {
 			wantBlockedEvent: true,
 		},
 		{
+			name: "maxNodes: a Failed member whose node is up takes a slot",
+			pool: gpuPoolWithGuards(int32Ptr(1), nil, nil),
+			machines: []client.Object{
+				scaleMachine("failed", gpu, "4", "8Gi", v1alpha1.MachineStateFailed),
+				readyNode("failed"),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken:        nil,
+			wantBlockedEvent: true,
+		},
+		{
+			name: "maxNodes: a Failed member whose node is down takes no slot",
+			pool: gpuPoolWithGuards(int32Ptr(1), nil, nil),
+			machines: []client.Object{
+				scaleMachine("failed", gpu, "4", "8Gi", v1alpha1.MachineStateFailed),
+				notReadyNode("failed"),
+				scaleMachine("idle", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+			},
+			wantWoken: []string{"idle"},
+		},
+		{
 			name: "maxNodes under cap: off member woken",
 			pool: gpuPoolWithGuards(int32Ptr(2), nil, nil),
 			machines: []client.Object{

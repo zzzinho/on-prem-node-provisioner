@@ -138,7 +138,10 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Per-pool guards, computed once over the membership: a pool at its
 		// maxNodes cap cannot wake any member; a pool still inside its
 		// cooldown.scaleUp window cannot wake another member until it lifts.
-		maxed := poolAtCap(pool, machines.Items)
+		maxed, err := r.poolAtCap(ctx, pool, machines.Items)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		poolCoolingUntil := r.coolingUntil(pool)
 
 		for j := range machines.Items {
@@ -317,19 +320,37 @@ func smallestCandidate(candidates []wakeCandidate) wakeCandidate {
 }
 
 // poolAtCap reports whether waking another member of this pool would exceed its
-// maxNodes. A nil MaxNodes is unbounded. The count is the pool's active members:
-// those powered on, transitioning while on, or about to power on (see isActive).
-func poolAtCap(pool *v1alpha1.NodePool, members []v1alpha1.Machine) bool {
+// maxNodes. A nil MaxNodes is unbounded. The count is the members that take a
+// slot (see countsAgainstCap).
+func (r *ScaleUpReconciler) poolAtCap(ctx context.Context, pool *v1alpha1.NodePool, members []v1alpha1.Machine) (bool, error) {
 	if pool.Spec.MaxNodes == nil {
-		return false
+		return false, nil
 	}
 	var active int32
 	for i := range members {
-		if isActive(&members[i]) {
+		counts, err := r.countsAgainstCap(ctx, &members[i])
+		if err != nil {
+			return false, err
+		}
+		if counts {
 			active++
 		}
 	}
-	return active >= *pool.Spec.MaxNodes
+	return active >= *pool.Spec.MaxNodes, nil
+}
+
+// countsAgainstCap reports whether a member takes a maxNodes slot: it is active
+// (isActive), or it is Failed while its Node is still up — a drain that timed out
+// leaves the node uncordoned and serving, a power-off that never landed leaves it
+// running — so it is a powered-on node the cap must see.
+func (r *ScaleUpReconciler) countsAgainstCap(ctx context.Context, m *v1alpha1.Machine) (bool, error) {
+	if isActive(m) {
+		return true, nil
+	}
+	if m.Status.State != v1alpha1.MachineStateFailed {
+		return false, nil
+	}
+	return nodeIsReady(ctx, r.Client, m.Spec.NodeName)
 }
 
 // isActive reports whether a Machine counts against its pool's maxNodes cap: it
