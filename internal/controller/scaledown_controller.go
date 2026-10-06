@@ -303,7 +303,7 @@ func (r *ScaleDownReconciler) announceHold(m *v1alpha1.Machine, eventType, reaso
 // never empty — which is how a Pod-level do-not-disrupt keeps its node out of
 // automatic scale-down without any special case here.
 func (r *ScaleDownReconciler) nodeEmpty(ctx context.Context, nodeName string) (bool, error) {
-	pods, err := workloadPodsOnNode(ctx, r.Client, nodeName)
+	pods, err := podsKeepingNodeOn(ctx, r.Client, nodeName)
 	if err != nil {
 		return false, err
 	}
@@ -575,7 +575,7 @@ func podEmptinessPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			pod, ok := e.Object.(*corev1.Pod)
-			return ok && pod.Spec.NodeName != "" && isWorkload(pod)
+			return ok && pod.Spec.NodeName != "" && keepsNodeOn(pod)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			pod, ok := e.Object.(*corev1.Pod)
@@ -588,9 +588,9 @@ func podEmptinessPredicate() predicate.Predicate {
 				return false
 			}
 			if oldPod.Spec.NodeName != newPod.Spec.NodeName {
-				return isWorkload(newPod)
+				return keepsNodeOn(newPod)
 			}
-			return isWorkload(oldPod) != isWorkload(newPod)
+			return keepsNodeOn(oldPod) != keepsNodeOn(newPod)
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}

@@ -47,9 +47,12 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	selector, err := metav1.LabelSelectorAsSelector(&pool.Spec.MachineSelector)
 	if err != nil {
-		// A malformed selector is an operator error in spec; it will not fix
-		// itself on requeue, so we report it and stop rather than hot-loop.
-		return ctrl.Result{}, fmt.Errorf("convert machineSelector for nodepool %q: %w", pool.Name, err)
+		// A malformed selector is an operator error in spec; a requeue cannot fix
+		// it, so report it on the pool and stop. Fixing the spec brings the pool
+		// back through its watch.
+		r.Recorder.Eventf(&pool, corev1.EventTypeWarning, "InvalidSelector",
+			"machineSelector is invalid, the pool selects no Machines until it is fixed: %v", err)
+		return ctrl.Result{}, nil
 	}
 
 	total, ready, err := r.countMembers(ctx, selector)

@@ -1536,3 +1536,27 @@ func TestReconcileBootingSkipsPoolTemplateOnConflict(t *testing.T) {
 	}
 	assertEvent(t, f.r.Recorder.(*record.FakeRecorder), reasonPoolConflict)
 }
+
+// TestReconcileDrainingStallsOnDoNotDisruptDaemonSetPod: a DaemonSet pod marked
+// do-not-disrupt is never evicted, and it keeps the drain from handing the node
+// to the power-off leg — the drain stalls into its timeout instead of powering
+// the node off under the pod.
+func TestReconcileDrainingStallsOnDoNotDisruptDaemonSetPod(t *testing.T) {
+	t.Parallel()
+
+	m := machine(v1alpha1.MachineStateDraining, nil)
+	start := metav1.NewTime(time.Now())
+	m.Status.DrainStartTime = &start
+	ds := doNotDisruptPod("backup-agent", "node-a")
+	ds.OwnerReferences = []metav1.OwnerReference{{Kind: "DaemonSet", Name: "backup"}}
+	f := newFixture(t, m, onpCordonedReadyNode("node-a"), ds)
+
+	f.reconcile(t)
+
+	if len(f.evicted) != 0 {
+		t.Errorf("evicted = %v, want none (DaemonSet pods are not drained)", f.evicted)
+	}
+	if got := f.getMachine(t).Status.State; got != v1alpha1.MachineStateDraining {
+		t.Errorf("state = %q, want %q while a do-not-disrupt pod remains", got, v1alpha1.MachineStateDraining)
+	}
+}

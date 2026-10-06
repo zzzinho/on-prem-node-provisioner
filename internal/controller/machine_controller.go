@@ -592,7 +592,7 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	// below until the timeout above fails it, rather than powering the node off
 	// with the protected pod still on it. Evicted pods still terminating count too,
 	// so power-off waits out their graceful shutdown.
-	workload, err := r.workloadPods(ctx, m.Spec.NodeName)
+	workload, err := podsKeepingNodeOn(ctx, r.Client, m.Spec.NodeName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list workload pods on node %q: %w", m.Spec.NodeName, err)
 	}
@@ -600,7 +600,7 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	if len(workload) == 0 {
 		// The cache says empty; the power-off leg is irreversible, so confirm with
 		// the API server — the cache may not yet show a pod bound a moment ago.
-		drained, err := noWorkloadOnNode(ctx, r.APIReader, m.Spec.NodeName)
+		drained, err := nothingKeepsNodeOn(ctx, r.APIReader, m.Spec.NodeName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1070,19 +1070,13 @@ func (r *MachineReconciler) uncordonIfONPCordoned(ctx context.Context, nodeName 
 	return true, nil
 }
 
-// workloadPods lists the pods scheduled on the node that keep it non-empty. See
-// workloadPodsOnNode for the exclusion rules.
-func (r *MachineReconciler) workloadPods(ctx context.Context, nodeName string) ([]corev1.Pod, error) {
-	return workloadPodsOnNode(ctx, r.Client, nodeName)
-}
-
-// workloadPodsOnNode lists the pods scheduled on the node and returns the ones that
-// make it non-empty (see isWorkload for the exclusion rules). The drain loop reads
-// it to decide when the node is empty enough to power off, and the scale-down path
-// reads it to decide whether the node is idle — so a node is detected "empty" by
-// exactly the condition the drain later confirms. What an unforced drain may
-// actually evict is the narrower isDrainable subset. nodeName "" yields no pods.
-func workloadPodsOnNode(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
+// podsKeepingNodeOn lists the pods scheduled on the node that keep it from being
+// powered off (see keepsNodeOn). The drain loop reads it to decide when the node
+// is empty enough to power off, and the scale-down path reads it to decide
+// whether the node is idle — so a node is detected "empty" by exactly the
+// condition the drain later confirms. What an unforced drain may actually evict
+// is the narrower isDrainable subset. nodeName "" yields no pods.
+func podsKeepingNodeOn(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
 	if nodeName == "" {
 		return nil, nil
 	}
@@ -1090,13 +1084,26 @@ func workloadPodsOnNode(ctx context.Context, c client.Client, nodeName string) (
 	if err := c.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
 		return nil, err
 	}
-	workload := make([]corev1.Pod, 0, len(pods.Items))
+	kept := make([]corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
-		if isWorkload(&pods.Items[i]) {
-			workload = append(workload, pods.Items[i])
+		if keepsNodeOn(&pods.Items[i]) {
+			kept = append(kept, pods.Items[i])
 		}
 	}
-	return workload, nil
+	return kept, nil
+}
+
+// keepsNodeOn reports whether a pod keeps its node from being powered off: it is
+// workload (see isWorkload), or it is any unfinished pod — a DaemonSet or static
+// pod included — carrying do-not-disrupt, which the annotation's contract honors
+// on every pod. A drain never evicts the latter (they are not drainable), so such
+// a node stalls and times out into Failed rather than going down under the pod.
+func keepsNodeOn(pod *corev1.Pod) bool {
+	if isWorkload(pod) {
+		return true
+	}
+	finished := pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+	return !finished && hasDoNotDisrupt(pod)
 }
 
 // evictPod issues one eviction through the injected Evict func, or the

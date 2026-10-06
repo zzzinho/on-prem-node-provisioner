@@ -587,6 +587,8 @@ func TestScaleDownMachinesForPod(t *testing.T) {
 func TestPodEmptinessPredicateUpdate(t *testing.T) {
 	succeeded := sdPod("app", "node-a", "")
 	succeeded.Status.Phase = corev1.PodSucceeded
+	protectedDS := sdPod("ds", "node-a", "DaemonSet")
+	protectedDS.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
 
 	tests := []struct {
 		name     string
@@ -597,6 +599,7 @@ func TestPodEmptinessPredicateUpdate(t *testing.T) {
 		{"daemonset pod bound to node", sdPod("ds", "", "DaemonSet"), sdPod("ds", "node-a", "DaemonSet"), false},
 		{"heartbeat on a bound pod", sdPod("app", "node-a", ""), sdPod("app", "node-a", ""), false},
 		{"pod reached terminal phase", sdPod("app", "node-a", ""), succeeded, true},
+		{"do-not-disrupt added to a daemonset pod", sdPod("ds", "node-a", "DaemonSet"), protectedDS, true},
 	}
 	pred := podEmptinessPredicate()
 	for _, tc := range tests {
@@ -719,5 +722,23 @@ func TestScaleDownAnnouncesHoldOnce(t *testing.T) {
 
 	if got := len(rec.Events); got != 1 {
 		t.Errorf("events after the hold came back = %d, want 1 new announcement", got)
+	}
+}
+
+// TestScaleDownDoNotDisruptDaemonSetPodKeepsNode: a DaemonSet pod marked
+// do-not-disrupt keeps its node out of automatic scale-down, as the annotation's
+// contract promises for every pod — the empty timer never starts.
+func TestScaleDownDoNotDisruptDaemonSetPodKeepsNode(t *testing.T) {
+	after := 5 * time.Minute
+	m := sdMachine("node-a", v1alpha1.MachineStateReady, nil)
+	ds := sdPod("backup-agent", "node-a", "DaemonSet")
+	ds.Annotations = map[string]string{v1alpha1.AnnotationDoNotDisrupt: v1alpha1.AnnotationDoNotDisruptValue}
+	pool := whenEmptyPool("edge", &after)
+	r, cl := newScaleDownReconciler(t, record.NewFakeRecorder(8), clocktesting.NewFakePassiveClock(scaleDownBase), m, ds, pool)
+
+	reconcileSD(t, r, "node-a")
+
+	if getSDMachine(t, cl, "node-a").Status.EmptySince != nil {
+		t.Fatal("emptySince stamped although a do-not-disrupt pod runs on the node")
 	}
 }
