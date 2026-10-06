@@ -440,6 +440,12 @@ func (r *MachineReconciler) reconcileReady(ctx context.Context, m *v1alpha1.Mach
 	if !ready {
 		return r.reconcileReadyNodeLost(ctx, m)
 	}
+	// A cordon marker left on a schedulable Node — someone uncordoned by hand after
+	// a Failed drain — would make a later operator cordon read as ONP's, and the
+	// next wake would lift it. Drop it while the Node is up and in service.
+	if err := r.dropStaleCordonMarker(ctx, m.Spec.NodeName); err != nil {
+		return ctrl.Result{}, err
+	}
 	if m.Status.NotReadySince != nil {
 		// The Node recovered within the grace window; drop the stale loss anchor.
 		if err := r.clearNotReadySince(ctx, m); err != nil {
@@ -549,17 +555,22 @@ func (r *MachineReconciler) reconcileDraining(ctx context.Context, m *v1alpha1.M
 	// more pods, and the stop must uncordon so the operator can recover the node —
 	// but only the cordon ONP itself placed, never an operator's pre-existing one.
 	if r.drainTimedOut(m, timeout) {
-		if _, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName); err != nil {
+		uncordoned, err := r.uncordonIfONPCordoned(ctx, m.Spec.NodeName)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		cordon := "uncordoned"
+		if !uncordoned {
+			cordon = "its cordon is not ONP's and was left as is"
 		}
 		m.Status.State = v1alpha1.MachineStateFailed
 		setCondition(m, v1alpha1.ConditionDrainSucceeded, metav1.ConditionFalse, reasonDrainTimeout,
-			fmt.Sprintf("Node %q did not drain within %s", m.Spec.NodeName, timeout))
+			fmt.Sprintf("Node %q did not drain within %s; %s", m.Spec.NodeName, timeout, cordon))
 		if err := r.Status().Update(ctx, m); err != nil {
 			return ctrl.Result{}, fmt.Errorf("fail machine %q on drain timeout: %w", m.Name, err)
 		}
 		r.Recorder.Eventf(m, corev1.EventTypeWarning, reasonDrainTimeout,
-			"Node %q did not drain within %s; uncordoned and marked Failed", m.Spec.NodeName, timeout)
+			"Node %q did not drain within %s; %s; marked Failed", m.Spec.NodeName, timeout, cordon)
 		metrics.RecordDrainFailure(metrics.ReasonDrainTimeout)
 		return ctrl.Result{}, nil
 	}
@@ -1014,6 +1025,24 @@ func (r *MachineReconciler) setCordon(ctx context.Context, nodeName string, unsc
 		return false, fmt.Errorf("uncordon node %q: %w", nodeName, err)
 	}
 	return true, nil
+}
+
+// dropStaleCordonMarker removes the cordoned-by-onp marker from a Node that is
+// no longer cordoned. The marker only means something on a cordoned Node.
+func (r *MachineReconciler) dropStaleCordonMarker(ctx context.Context, nodeName string) error {
+	node, err := backingNode(ctx, r.Client, nodeName)
+	if err != nil || node == nil || node.Spec.Unschedulable {
+		return err
+	}
+	if _, marked := node.Annotations[v1alpha1.AnnotationCordonedByONP]; !marked {
+		return nil
+	}
+	patch := client.MergeFrom(node.DeepCopy())
+	delete(node.Annotations, v1alpha1.AnnotationCordonedByONP)
+	if err := r.Patch(ctx, node, patch); err != nil {
+		return fmt.Errorf("drop stale cordon marker from node %q: %w", nodeName, err)
+	}
+	return nil
 }
 
 // uncordonIfONPCordoned lifts a cordon ONP placed during a prior scale-down, so a

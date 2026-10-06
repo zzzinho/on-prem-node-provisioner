@@ -1224,6 +1224,28 @@ func TestReconcileDrainingTimeoutLeavesOperatorCordon(t *testing.T) {
 	if n := f.getNode(t, "node-a"); !n.Spec.Unschedulable {
 		t.Error("operator cordon lifted on timeout, want preserved (only ONP's own cordon is lifted)")
 	}
+	for _, e := range f.events(t) {
+		if strings.Contains(e, reasonDrainTimeout) && !strings.Contains(e, "left as is") {
+			t.Errorf("event = %q, want it to say the operator's cordon was left as is", e)
+		}
+	}
+}
+
+// TestReconcileReadyDropsStaleCordonMarker: a cordon marker left on a Node that
+// is schedulable again is removed, so a later operator cordon is not mistaken for
+// ONP's and lifted by the next wake.
+func TestReconcileReadyDropsStaleCordonMarker(t *testing.T) {
+	t.Parallel()
+
+	node := readyNode("node-a")
+	node.Annotations = map[string]string{v1alpha1.AnnotationCordonedByONP: "true"}
+	f := newFixture(t, machine(v1alpha1.MachineStateReady, nil), node)
+
+	f.reconcile(t)
+
+	if _, marked := f.getNode(t, "node-a").Annotations[v1alpha1.AnnotationCordonedByONP]; marked {
+		t.Error("stale cordon marker kept on a schedulable Node, want removed")
+	}
 }
 
 // TestReconcileOffTidiesStaleDrainNow: a drain-now left on an Off Machine (set by
