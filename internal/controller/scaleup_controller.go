@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -157,7 +158,11 @@ func (r *ScaleUpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			node := nodeForMachine(m, pool, real)
+			bound, err := boundRequests(ctx, r.Client, m.Spec.NodeName)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			node := nodeForMachine(m, pool, real, bound)
 			if !scheduler.Fit(&pod, node).Fits {
 				continue
 			}
@@ -295,8 +300,9 @@ func (r *ScaleUpReconciler) requestWake(ctx context.Context, m *v1alpha1.Machine
 // the pool Template labels, then the Machine's own Labels (Machine wins on
 // conflict), and the Template taints. Lifecycle taints (node.kubernetes.io/*)
 // only describe the node being down and are dropped, as is a cordon ONP placed
-// itself, which the wake lifts. Its declared Capacity becomes allocatable.
-func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool, real *corev1.Node) *corev1.Node {
+// itself, which the wake lifts. Allocatable is the room left once it is up (see
+// syntheticAllocatable); bound holds the requests of pods still bound to it.
+func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool, real *corev1.Node, bound corev1.ResourceList) *corev1.Node {
 	labels := map[string]string{corev1.LabelHostname: m.Spec.NodeName}
 	var taints []corev1.Taint
 	var cordoned bool
@@ -325,9 +331,75 @@ func nodeForMachine(m *v1alpha1.Machine, pool *v1alpha1.NodePool, real *corev1.N
 		},
 		Spec: corev1.NodeSpec{Taints: taints, Unschedulable: cordoned},
 		Status: corev1.NodeStatus{
-			Allocatable: m.Spec.Capacity,
+			Allocatable: syntheticAllocatable(m.Spec.Capacity, real, bound),
 		},
 	}
+}
+
+// syntheticAllocatable is the room a Machine's node will offer once Ready. Per
+// native resource (cpu, memory, ...) it takes the declared capacity capped by the
+// allocatable the Node last reported — kubelet reservations come off the top. A
+// declared extended resource (nvidia.com/gpu) is not capped: a device plugin that
+// had not registered yet, or had just stopped, reports it as 0, and that 0 would
+// keep the node from ever being woken for the pods it exists for. A resource the
+// Machine does not declare comes from the Node.
+// The requests of pods still bound to the node (DaemonSet pods stay bound while
+// it is off, and the scheduler counts them) are subtracted, floored at zero.
+func syntheticAllocatable(capacity corev1.ResourceList, real *corev1.Node, bound corev1.ResourceList) corev1.ResourceList {
+	out := capacity.DeepCopy()
+	if out == nil {
+		out = corev1.ResourceList{}
+	}
+	if real != nil {
+		for name, reported := range real.Status.Allocatable {
+			declared, ok := out[name]
+			if !ok || (!isExtendedResource(name) && reported.Cmp(declared) < 0) {
+				out[name] = reported.DeepCopy()
+			}
+		}
+	}
+	for name, used := range bound {
+		avail, ok := out[name]
+		if !ok {
+			continue
+		}
+		avail.Sub(used)
+		if avail.Sign() < 0 {
+			avail = resource.Quantity{}
+		}
+		out[name] = avail
+	}
+	return out
+}
+
+// isExtendedResource reports whether name is a domain-qualified resource such as
+// a device plugin's nvidia.com/gpu, as opposed to a native one (cpu, memory,
+// ephemeral-storage, hugepages-*).
+func isExtendedResource(name corev1.ResourceName) bool {
+	return strings.Contains(string(name), "/")
+}
+
+// boundRequests sums the requests of pods bound to nodeName that will still hold
+// their place once it boots: everything but finished pods and pods already being
+// deleted, which the kubelet clears as it comes up.
+func boundRequests(ctx context.Context, c client.Client, nodeName string) (corev1.ResourceList, error) {
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.MatchingFields{IndexPodNodeName: nodeName}); err != nil {
+		return nil, fmt.Errorf("list pods on node %q: %w", nodeName, err)
+	}
+	total := corev1.ResourceList{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for name, q := range resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{}) {
+			sum := total[name]
+			sum.Add(q)
+			total[name] = sum
+		}
+	}
+	return total, nil
 }
 
 // backingNode returns the named Node, or nil when it does not exist (a Machine

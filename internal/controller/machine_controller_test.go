@@ -1319,7 +1319,7 @@ func TestReconcileBootingWarnsOnCapacityDrift(t *testing.T) {
 	m.Status.BootStartTime = &start
 
 	node := readyNode("node-a")
-	node.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+	node.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
 
 	f := newFixture(t, m, node)
 
@@ -1346,7 +1346,7 @@ func TestReconcileBootingNoCapacityDriftWhenMatching(t *testing.T) {
 	m.Status.BootStartTime = &start
 
 	node := readyNode("node-a")
-	node.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
+	node.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resourceQty("4")}
 
 	f := newFixture(t, m, node)
 

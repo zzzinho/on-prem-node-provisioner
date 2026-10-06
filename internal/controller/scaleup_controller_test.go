@@ -55,6 +55,22 @@ func readyMachineSince(name string, lbls map[string]string, since time.Time) *v1
 	return m
 }
 
+// boundPod builds a Running pod bound to node requesting cpu, as a DaemonSet pod
+// stays bound to a node while it is off.
+func boundPod(name, node, cpu string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: node,
+			Containers: []corev1.Container{{
+				Name:      "c",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
 // offNode builds the Node object a powered-off Machine leaves behind, adjusted by
 // edit.
 func offNode(name string, edit func(*corev1.Node)) *corev1.Node {
@@ -98,6 +114,14 @@ func newScaleUpReconciler(t *testing.T, rec record.EventRecorder, objs ...client
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.NodePool{}).
+		// Mirror main.go's pod index so pods still bound to a node resolve.
+		WithIndex(&corev1.Pod{}, IndexPodNodeName, func(o client.Object) []string {
+			pod, ok := o.(*corev1.Pod)
+			if !ok || pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).
 		WithObjects(objs...).
 		Build()
 	clk := clocktesting.NewFakePassiveClock(scaleUpBase)
@@ -286,6 +310,80 @@ func TestScaleUpReconcileWakesBestFitMachine(t *testing.T) {
 				}),
 			},
 			wantWoken: []string{"down"},
+			wantEvent: true,
+		},
+		{
+			name: "pods still bound to the off node take their share of its capacity",
+			pod:  pendingPod("3500m", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				boundPod("ds-1", "g1", "1"),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "a pod being deleted on the off node does not take capacity",
+			pod:  pendingPod("3500m", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				func() client.Object {
+					p := boundPod("leaving", "g1", "4")
+					now := metav1.NewTime(scaleUpBase)
+					p.DeletionTimestamp = &now
+					p.Finalizers = []string{"keep"}
+					return p
+				}(),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "node's last reported allocatable caps the declared capacity",
+			pod:  pendingPod("3500m", "1Gi", true),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) {
+					n.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}
+				}),
+			},
+			wantWoken: nil,
+			wantEvent: false,
+		},
+		{
+			name: "a declared GPU is not capped by a node that last reported none",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.Containers[0].Resources.Requests["nvidia.com/gpu"] = resource.MustParse("1")
+				return p
+			}(),
+			machines: []client.Object{
+				func() client.Object {
+					m := scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff)
+					m.Spec.Capacity["nvidia.com/gpu"] = resource.MustParse("1")
+					return m
+				}(),
+				offNode("g1", func(n *corev1.Node) {
+					n.Status.Allocatable = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("0")}
+				}),
+			},
+			wantWoken: []string{"g1"},
+			wantEvent: true,
+		},
+		{
+			name: "a resource the Machine does not declare comes from the node",
+			pod: func() *corev1.Pod {
+				p := pendingPod("1", "1Gi", true)
+				p.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+				return p
+			}(),
+			machines: []client.Object{
+				scaleMachine("g1", gpu, "4", "8Gi", v1alpha1.MachineStateOff),
+				offNode("g1", func(n *corev1.Node) {
+					n.Status.Allocatable = corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("100Gi")}
+				}),
+			},
+			wantWoken: []string{"g1"},
 			wantEvent: true,
 		},
 		{
