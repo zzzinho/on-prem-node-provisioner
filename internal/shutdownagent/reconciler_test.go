@@ -313,3 +313,26 @@ func TestParseBootTime(t *testing.T) {
 		t.Error("parseBootTime() without btime: err = nil, want error")
 	}
 }
+
+// TestReconcilePowerOffFailureRecordsEvent: a failed power-off leaves a
+// PowerOffFailed Warning on the Machine with the command's error, so the operator
+// sees why the node did not go down rather than only a later ShutdownTimeout.
+func TestReconcilePowerOffFailureRecordsEvent(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, errors.New("nsenter: permission denied"), machine("node-a", thisNode, v1alpha1.MachineStateShuttingDown))
+	if _, err := f.r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "node-a"},
+	}); err == nil {
+		t.Fatal("Reconcile() err = nil, want the power-off error")
+	}
+
+	select {
+	case e := <-f.recorder.Events:
+		if !strings.Contains(e, reasonPowerOffFailed) || !strings.Contains(e, "permission denied") {
+			t.Errorf("event = %q, want %s carrying the command error", e, reasonPowerOffFailed)
+		}
+	default:
+		t.Errorf("no %s event recorded", reasonPowerOffFailed)
+	}
+}

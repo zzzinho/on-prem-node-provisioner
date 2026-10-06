@@ -35,6 +35,10 @@ const reasonPoweringOff = "PoweringOff"
 // power-off because the host booted after it was requested.
 const reasonPowerOffSkipped = "PowerOffSkipped"
 
+// reasonPowerOffFailed is the Event reason emitted when the host power-off
+// command fails.
+const reasonPowerOffFailed = "PowerOffFailed"
+
 // ShutdownReconciler powers its own node off when the backing Machine reaches
 // ShuttingDown. It only ever acts on the Machine whose spec.nodeName equals
 // NodeName; the watch is filtered to that Machine, and Reconcile re-checks it as
@@ -123,7 +127,13 @@ func (r *ShutdownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	logger.Info("machine is ShuttingDown, powering node off", "node", r.NodeName)
 	if err := r.PowerOff(ctx); err != nil {
-		// Not recorded as issued, so the requeue retries the power-off.
+		// Not recorded as issued, so the requeue retries the power-off. Surface the
+		// failure on the Machine: otherwise an operator only sees the controller's
+		// ShutdownTimeout minutes later, without the command's output.
+		if r.Recorder != nil {
+			r.Recorder.Eventf(&m, corev1.EventTypeWarning, reasonPowerOffFailed,
+				"power-off on node %q failed: %v", r.NodeName, err)
+		}
 		return ctrl.Result{}, fmt.Errorf("power off node %q: %w", r.NodeName, err)
 	}
 	r.issued, r.issuedFor = true, episode

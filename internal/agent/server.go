@@ -79,9 +79,12 @@ func Handler(waker Waker, logger *slog.Logger, token string) http.Handler {
 			return
 		}
 
+		// ParseMAC also accepts EUI-64 and 20-octet InfiniBand addresses, which a
+		// magic packet cannot carry; reject them here as the client's error rather
+		// than failing the send and answering 502 as if the network were at fault.
 		mac, err := net.ParseMAC(req.MacAddress)
-		if err != nil {
-			http.Error(w, "invalid macAddress", http.StatusBadRequest)
+		if err != nil || len(mac) != 6 {
+			http.Error(w, "invalid macAddress: want a 6-byte (EUI-48) MAC", http.StatusBadRequest)
 			return
 		}
 

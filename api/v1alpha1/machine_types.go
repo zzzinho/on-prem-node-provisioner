@@ -56,8 +56,10 @@ type PowerSpec struct {
 
 // WoLConfig configures the Wake-on-LAN power-on path.
 type WoLConfig struct {
-	// MacAddress is the target NIC's MAC, e.g. "aa:bb:cc:dd:ee:ff".
+	// MacAddress is the target NIC's MAC, e.g. "aa:bb:cc:dd:ee:ff" — six octets,
+	// ':' or '-' separated, the only form a magic packet can carry.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$`
 	MacAddress string `json:"macAddress"`
 
 	// BroadcastAddress is the L2 broadcast destination for the magic packet.
